@@ -1,1022 +1,1005 @@
-// RTLSDR-Airband Frequency Recorder GUI - vanilla JS, no build step.
+// Frequency Recorder - vanilla JS, no build step. Talks to the backend in app/backend.
+"use strict";
 
-let configData = {};
-let rawText = "";
-let logSince = 0;
-let logPollTimer = null;
-let lastKnownRecordingsDir = "~/airband-recordings";
+const $ = (sel, el = document) => el.querySelector(sel);
+const $$ = (sel, el = document) => Array.from(el.querySelectorAll(sel));
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+const DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const ICON = {
+  play: '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7 4l13 8-13 8z"/></svg>',
+  pause: '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 4h4v16H6zM14 4h4v16h-4z"/></svg>',
+  headphones: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 14v-2a9 9 0 0 1 18 0v2"/><rect x="3" y="14" width="4" height="7" rx="1"/><rect x="17" y="14" width="4" height="7" rx="1"/></svg>',
+  edit: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 20h4L19 9l-4-4L4 16z"/></svg>',
+  folder: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>',
+  trash: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg>',
+  plus: '<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
+  alert: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 3l10 18H2z"/><path d="M12 10v4M12 18h0"/></svg>',
+  left: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg>',
+  right: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>',
+};
 
-// ---------- live listening ----------
-let livePortBase = 17300;
-let liveSampleRate = 16000;
-let audioCtx = null;
-// port -> { gainNode, since, nextStartTime, timer, gotAudio, lastVolume, muted, statusEl }
-const liveSessions = {};
+let station = null;
+let ctcssTones = [];
+let info = {};
+let status = null;
+let recent = [];
+let recentLoaded = 0;
 
-function ensureAudioCtx() {
-  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  if (audioCtx.state === "suspended") audioCtx.resume();
-  return audioCtx;
-}
+// ---------- small helpers ----------
 
-function findUdpOutput(ch) {
-  return (ch.outputs || []).find((o) => scalarGet(o, "type", "") === "udp_stream");
-}
-
-function channelLivePort(ch, idx) {
-  const existing = findUdpOutput(ch);
-  return existing ? scalarGet(existing, "dest_port", livePortBase + idx) : livePortBase + idx;
-}
-
-function setLiveEnabled(ch, idx, enabled) {
-  if (!Array.isArray(ch.outputs)) ch.outputs = [];
-  const existing = findUdpOutput(ch);
-  if (enabled && !existing) {
-    ch.outputs.push({
-      type: scalar("string", "udp_stream"),
-      dest_address: scalar("string", "127.0.0.1"),
-      dest_port: scalar("int", livePortBase + idx),
-    });
-  } else if (!enabled && existing) {
-    stopListening(channelLivePort(ch, idx));
-    ch.outputs.splice(ch.outputs.indexOf(existing), 1);
+async function api(path, opts = {}) {
+  const init = { method: opts.method || "GET", headers: {} };
+  if (opts.body !== undefined) {
+    init.headers["content-type"] = "application/json";
+    init.body = JSON.stringify(opts.body);
   }
-}
-
-function startListening(port, initialVolume, initialMuted, statusEl) {
-  const ctx = ensureAudioCtx();
-  const gainNode = ctx.createGain();
-  gainNode.gain.value = initialMuted ? 0 : initialVolume;
-  gainNode.connect(ctx.destination);
-  const session = {
-    gainNode,
-    since: 0,
-    nextStartTime: ctx.currentTime,
-    gotAudio: false,
-    lastVolume: initialVolume,
-    muted: initialMuted,
-    statusEl,
-  };
-  liveSessions[port] = session;
-  statusEl.textContent = "Buffering…";
-
-  session.timer = setInterval(async () => {
-    const s = liveSessions[port];
-    if (!s) return;
-    try {
-      const data = await api(`/api/live/${port}/chunk?since=${s.since}`);
-      s.since = data.next;
-      if (!data.chunk) return;
-      const bytes = Uint8Array.from(atob(data.chunk), (c) => c.charCodeAt(0));
-      const floatCount = Math.floor(bytes.length / 4);
-      if (floatCount === 0) return;
-      const floats = new Float32Array(bytes.buffer, 0, floatCount);
-      const buffer = ctx.createBuffer(1, floatCount, liveSampleRate);
-      buffer.copyToChannel(floats, 0);
-      const src = ctx.createBufferSource();
-      src.buffer = buffer;
-      src.connect(s.gainNode);
-      const startAt = Math.max(ctx.currentTime, s.nextStartTime);
-      src.start(startAt);
-      s.nextStartTime = startAt + buffer.duration;
-      s.gotAudio = true;
-      s.statusEl.textContent = "Live";
-    } catch (err) {
-      s.statusEl.textContent = err.message;
-    }
-  }, 250);
-}
-
-function stopListening(port) {
-  const session = liveSessions[port];
-  if (!session) return;
-  clearInterval(session.timer);
-  session.gainNode.disconnect();
-  delete liveSessions[port];
-}
-
-function stopAllListening() {
-  Object.keys(liveSessions).forEach((port) => stopListening(Number(port)));
-}
-
-// ---------- generic helpers ----------
-function makeEl(tag, cls, text) {
-  const el = document.createElement(tag);
-  if (cls) el.className = cls;
-  if (text !== undefined) el.textContent = text;
-  return el;
-}
-function isPlainObject(v) {
-  return v !== null && typeof v === "object" && !Array.isArray(v);
-}
-function isScalar(v) {
-  return isPlainObject(v) && v.__scalar__ === true;
-}
-function scalar(type, value) {
-  return { __scalar__: true, type, value };
-}
-function scalarGet(obj, key, fallback) {
-  return obj && isScalar(obj[key]) ? obj[key].value : fallback;
-}
-function scalarSet(obj, key, type, value) {
-  if (isScalar(obj[key])) obj[key].value = value;
-  else obj[key] = scalar(type, value);
-}
-
-async function api(path, opts) {
-  const res = await fetch(path, opts);
+  const res = await fetch(path, init);
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+  if (!res.ok) throw new Error(data.error || `${res.status} ${res.statusText}`);
   return data;
 }
 
-function setMsg(elId, text, isError) {
-  const el = document.getElementById(elId);
-  el.textContent = text;
-  el.className = "save-msg" + (isError ? " error" : "");
-  setTimeout(() => { el.textContent = ""; }, 4000);
+function fmtMhz(mhz) {
+  const s = Number(mhz).toFixed(4);
+  return s.endsWith("0") ? s.slice(0, -1) : s;
+}
+const label = (f) => (f.name && f.name.trim()) || `${fmtMhz(f.mhz)} MHz`;
+const sameMhz = (a, b) => Math.abs(a - b) < 0.0005;
+const clock = (unix) => new Date(unix * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+const clockSec = (unix) => new Date(unix * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+
+function dur(sec) {
+  if (sec == null || !isFinite(sec)) return "";
+  sec = Math.max(0, Math.round(sec));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  return h ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}` : `${m}:${String(s).padStart(2, "0")}`;
 }
 
-// ================================================================
-// Repeaters tab
-// ================================================================
-function normalizeDevice() {
-  if (!Array.isArray(configData.devices)) configData.devices = [];
-  if (configData.devices.length === 0) {
-    configData.devices.push({
-      type: scalar("string", "rtlsdr"),
-      index: scalar("int", 0),
-      gain: scalar("int", 30),
-      centerfreq: scalar("float", 145.0),
-      correction: scalar("int", 0),
-      channels: [],
-    });
+function ago(unix) {
+  if (!unix) return "Not heard yet";
+  const s = Date.now() / 1000 - unix;
+  if (s < 60) return "Heard just now";
+  if (s < 3600) return `Heard ${Math.round(s / 60)} min ago`;
+  if (s < 86400 * 2) return `Heard ${Math.round(s / 3600)} h ago`;
+  return `Heard ${Math.round(s / 86400)} days ago`;
+}
+
+function uptime(unix) {
+  const s = Date.now() / 1000 - unix;
+  if (s < 60) return "just started";
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  return d ? `up ${d} d ${h} h` : h ? `up ${h} h ${m} min` : `up ${m} min`;
+}
+
+function bytes(n) {
+  if (n == null) return "…";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return `${n.toFixed(i && n < 10 ? 1 : 0)} ${u[i]}`;
+}
+
+function startOfDay(d) { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; }
+const unixOf = (d) => d.getTime() / 1000;
+const dateInput = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const encodePath = (p) => p.split("/").map(encodeURIComponent).join("/");
+
+let toastTimer = null;
+function toast(msg, isError = false) {
+  let el = $(".toast");
+  if (!el) { el = document.createElement("div"); el.className = "toast"; el.setAttribute("role", "status"); document.body.appendChild(el); }
+  el.textContent = msg;
+  el.classList.toggle("err", isError);
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.remove(), isError ? 6000 : 2500);
+}
+
+async function saveStation(next, okMsg = "Saved") {
+  try {
+    const res = await api("/api/station", { method: "PUT", body: next });
+    station = res.station;
+    if (okMsg) toast(okMsg);
+    pollStatus();
+    return true;
+  } catch (e) {
+    toast(e.message, true);
+    return false;
   }
-  const device = configData.devices[0];
-  if (!isScalar(device.type)) device.type = scalar("string", "rtlsdr");
-  if (!isScalar(device.index)) device.index = scalar("int", 0);
-  if (!isScalar(device.gain)) device.gain = scalar("int", 30);
-  if (!isScalar(device.centerfreq)) device.centerfreq = scalar("float", 145.0);
-  if (!isScalar(device.correction)) device.correction = scalar("int", 0);
-  if (!Array.isArray(device.channels)) device.channels = [];
-  return device;
+}
+const clone = (o) => JSON.parse(JSON.stringify(o));
+
+// ---------- routing ----------
+
+let route = { name: "monitor", arg: null, query: {} };
+
+function parseRoute() {
+  const [path, qs] = (location.hash.replace(/^#\/?/, "") || "monitor").split("?");
+  const [name, arg] = path.split("/");
+  route = { name: name || "monitor", arg: arg ? decodeURIComponent(arg) : null, query: Object.fromEntries(new URLSearchParams(qs || "")) };
 }
 
-function makeDeviceField(labelText, obj, key, type) {
-  const wrap = makeEl("div", "field");
-  wrap.appendChild(makeEl("label", null, labelText));
-  const input = document.createElement("input");
-  input.type = "number";
-  input.step = type === "int" ? "1" : "any";
-  input.value = scalarGet(obj, key, 0);
-  input.oninput = () => {
-    const n = type === "int" ? parseInt(input.value, 10) : parseFloat(input.value);
-    scalarSet(obj, key, type, Number.isNaN(n) ? 0 : n);
-  };
-  wrap.appendChild(input);
-  return wrap;
+function render() {
+  parseRoute();
+  stopEditorTimers();
+  $$(".nav a").forEach((a) => a.classList.toggle("active", a.dataset.nav === route.name && !(route.name === "frequency" && route.arg !== "new")));
+  const main = $("#main");
+  const views = { monitor: viewMonitor, recordings: viewRecordings, nets: viewNets, net: viewNetEditor, frequency: viewFrequency, settings: viewSettings };
+  (views[route.name] || viewMonitor)(main);
+  updateChrome();
 }
 
-function makeTextField(labelText, obj, key, fullWidth) {
-  const wrap = makeEl("div", "field" + (fullWidth ? " full" : ""));
-  wrap.appendChild(makeEl("label", null, labelText));
-  const input = document.createElement("input");
-  input.type = "text";
-  input.value = scalarGet(obj, key, "");
-  input.oninput = () => scalarSet(obj, key, "string", input.value);
-  wrap.appendChild(input);
-  return wrap;
+// ---------- chrome: header, banners, disk ----------
+
+function updateChrome() {
+  if (!status) return;
+  const pill = $("#status-pill"), text = $("#status-text"), btn = $("#btn-recording");
+  const st = status.state;
+  pill.className = "pill " + ({ recording: "ok", starting: "warn", waiting: "bad" }[st] || "");
+  text.textContent = {
+    recording: `Recording · ${status.started_unix ? uptime(status.started_unix) : ""}`,
+    starting: "Starting…",
+    waiting: "Not recording",
+    off: "Recording stopped",
+    setup: "Add a frequency to start",
+  }[st] || st;
+  btn.classList.toggle("hidden", st === "setup");
+  btn.textContent = status.recording_enabled ? "Stop recording" : "Start recording";
+  btn.classList.toggle("primary", !status.recording_enabled);
+  const net = $("#net-pill");
+  net.classList.toggle("hidden", !status.active_nets.length);
+  net.textContent = status.active_nets.length ? `● ${status.active_nets.join(", ")}` : "";
+  $("#window-text").textContent = status.plan ? `Watching ${status.plan.low_mhz.toFixed(2)} – ${status.plan.high_mhz.toFixed(2)} MHz` : "";
+  $("#disk-box").innerHTML = `<b>Recordings</b>${bytes(status.disk.used_bytes)} used<br>${status.disk.free_bytes != null ? bytes(status.disk.free_bytes) + " free" : ""}`;
+  const banners = $("#banners");
+  if (banners) banners.innerHTML = bannerHtml();
 }
 
-function makeNumberField(labelText, obj, key, type) {
-  const wrap = makeEl("div", "field");
-  wrap.appendChild(makeEl("label", null, labelText));
-  const input = document.createElement("input");
-  input.type = "number";
-  input.step = type === "int" ? "1" : "any";
-  input.value = scalarGet(obj, key, 0);
-  input.oninput = () => {
-    const n = type === "int" ? parseInt(input.value, 10) : parseFloat(input.value);
-    scalarSet(obj, key, type, Number.isNaN(n) ? 0 : n);
-  };
-  wrap.appendChild(input);
-  return wrap;
+function bannerHtml() {
+  if (!status) return "";
+  const out = [];
+  if (status.state === "waiting" && status.problem) out.push(`<div class="banner" role="alert">${ICON.alert}<div>${esc(status.problem)}</div></div>`);
+  for (const w of status.warnings) out.push(`<div class="banner warn" role="status">${ICON.alert}<div>${esc(w)}</div></div>`);
+  return out.join("");
 }
 
-// Handheld-radio-style squelch: a 0-9 level like a Baofeng's SQL knob, mapped
-// onto the engine's squelch_snr_threshold (dB above the measured noise floor).
-// 0 = "always open" (the engine's own meaning for squelch_snr_threshold=0);
-// the engine's built-in auto default is 9.54 dB, i.e. level 5 on this scale.
-const SQUELCH_LEVEL_DB_STEP = 2;
-const SQUELCH_AUTO_DEFAULT_DB = 9.54;
-
-function squelchLevelToDb(level) {
-  return level * SQUELCH_LEVEL_DB_STEP;
-}
-function squelchDbToLevel(db) {
-  return Math.max(0, Math.min(9, Math.round(db / SQUELCH_LEVEL_DB_STEP)));
-}
-
-function makeSquelchField(ch) {
-  const wrap = makeEl("div", "field full");
-  if (isScalar(ch.squelch_threshold)) {
-    wrap.appendChild(makeEl("label", null, "Squelch"));
-    wrap.appendChild(makeEl("p", "muted", "This channel uses an advanced absolute squelch_threshold (dBFS) — edit it in the Advanced tab."));
-    return wrap;
+async function pollStatus() {
+  try {
+    status = await api("/api/status");
+  } catch {
+    $("#status-pill").className = "pill bad";
+    $("#status-text").textContent = "App not responding";
+    return;
   }
-
-  const currentDb = isScalar(ch.squelch_snr_threshold) ? ch.squelch_snr_threshold.value : SQUELCH_AUTO_DEFAULT_DB;
-  const currentLevel = squelchDbToLevel(currentDb);
-  const labelEl = makeEl("label", null, "");
-  const setLabel = (level) => {
-    labelEl.textContent = `Squelch level (like a handheld radio) · ${level === 0 ? "0 — always open" : level}`;
-  };
-  setLabel(currentLevel);
-  wrap.appendChild(labelEl);
-
-  const row = makeEl("div", "squelch-row");
-  const slider = document.createElement("input");
-  slider.type = "range";
-  slider.min = "0";
-  slider.max = "9";
-  slider.step = "1";
-  slider.value = currentLevel;
-  slider.oninput = () => {
-    const level = parseInt(slider.value, 10);
-    setLabel(level);
-    scalarSet(ch, "squelch_snr_threshold", "float", squelchLevelToDb(level));
-  };
-  row.appendChild(slider);
-  wrap.appendChild(row);
-  wrap.appendChild(makeEl("p", "muted", "0 = hear everything (noise too) · 9 = only the strongest signals open it"));
-  return wrap;
+  updateChrome();
+  if (route.name === "monitor") updateMonitorLive();
+  if (route.name === "nets") updateNetsLive();
 }
 
-// Frequency (MHz, 3 decimals) both leads the filename and names its own
-// subfolder, so on disk this is <recordings_dir>/<freq>/<YYYY>/<MM>/<DD>/...
-// (the YYYY/MM/DD nesting comes from dated_subdirectories=true, built by the
-// engine itself - see make_dated_subdirs in src/helper_functions.cpp). That
-// layout groups everything for one frequency together first, then by date -
-// e.g. for scripting a daily transcription pass over one frequency's clips.
-function formatFreqForFilename(mhz) {
-  return (typeof mhz === "number" && !Number.isNaN(mhz) ? mhz : 0).toFixed(3);
+async function loadRecent(force = false) {
+  if (!force && Date.now() - recentLoaded < 30000) return;
+  recentLoaded = Date.now();
+  try {
+    const res = await api(`/api/recordings?from=${Date.now() / 1000 - 86400}`);
+    recent = res.recordings;
+  } catch { /* keep the old list */ }
 }
 
-function makeDefaultFileOutput(name, freqMhz) {
-  const freqPart = formatFreqForFilename(freqMhz);
-  const namePart = (name || "").trim().replace(/\s+/g, "_");
-  const template = namePart ? `${freqPart}_${namePart}` : freqPart;
-  const baseDir = lastKnownRecordingsDir.replace(/\/+$/, "");
-  return {
-    type: scalar("string", "file"),
-    directory: scalar("string", `${baseDir}/${freqPart}`),
-    filename_template: scalar("string", template),
-    dated_subdirectories: scalar("bool", true),
-    split_on_transmission: scalar("bool", true),
-  };
-}
-function makeDefaultIcecastOutput() {
-  return {
-    type: scalar("string", "icecast"),
-    server: scalar("string", ""),
-    port: scalar("int", 8000),
-    mountpoint: scalar("string", ""),
-    username: scalar("string", "source"),
-    password: scalar("string", ""),
-  };
+// ---------- live listening ----------
+
+let audioCtx = null;
+let live = null; // { port, timer, gain, since, next }
+
+function stopLive() {
+  if (!live) return;
+  clearInterval(live.timer);
+  live.gain.disconnect();
+  live = null;
 }
 
-function makeRepeaterCard(device, ch, idx) {
-  const card = makeEl("div", "card");
+function startLive(port) {
+  stopLive();
+  if (!audioCtx) audioCtx = new AudioContext();
+  audioCtx.resume();
+  const gain = audioCtx.createGain();
+  gain.connect(audioCtx.destination);
+  live = { port, gain, since: 0, next: 0, first: true };
+  live.timer = setInterval(async () => {
+    const s = live;
+    if (!s || s.port !== port) return;
+    try {
+      const data = await api(`/api/live/${port}/chunk?since=${s.since}`);
+      // the first poll skips what was buffered before we started listening
+      if (s.first) { s.first = false; s.since = data.next; return; }
+      s.since = data.next;
+      if (!data.chunk) return;
+      const raw = Uint8Array.from(atob(data.chunk), (c) => c.charCodeAt(0));
+      const n = Math.floor(raw.length / 4);
+      if (!n) return;
+      const buf = audioCtx.createBuffer(1, n, status ? status.live_sample_rate : 16000);
+      buf.copyToChannel(new Float32Array(raw.buffer, 0, n), 0);
+      const src = audioCtx.createBufferSource();
+      src.buffer = buf;
+      src.connect(s.gain);
+      const at = Math.max(audioCtx.currentTime + 0.05, s.next);
+      src.start(at);
+      s.next = at + buf.duration;
+    } catch { /* engine restarting: try again next tick */ }
+  }, 250);
+}
 
-  const top = makeEl("div", "card-top");
-  const nameInput = document.createElement("input");
-  nameInput.className = "name-input";
-  nameInput.type = "text";
-  nameInput.placeholder = `Frequency ${idx + 1}`;
-  nameInput.value = scalarGet(ch, "label", "");
-  nameInput.oninput = () => scalarSet(ch, "label", "string", nameInput.value);
-  top.appendChild(nameInput);
-  const removeBtn = makeEl("button", "remove-btn", "✕");
-  removeBtn.title = "Remove this frequency";
-  removeBtn.onclick = () => {
-    if (findUdpOutput(ch)) stopListening(channelLivePort(ch, idx));
-    device.channels.splice(idx, 1);
-    renderRepeatersTab();
-  };
-  top.appendChild(removeBtn);
-  card.appendChild(top);
+function previewBeep() {
+  if (!audioCtx) audioCtx = new AudioContext();
+  audioCtx.resume();
+  const t0 = audioCtx.currentTime + 0.1;
+  for (const start of [t0, t0 + 0.13]) {
+    const osc = audioCtx.createOscillator(), g = audioCtx.createGain();
+    osc.frequency.value = 880;
+    g.gain.setValueAtTime(0, start);
+    g.gain.linearRampToValueAtTime(0.1, start + 0.008);
+    g.gain.setValueAtTime(0.1, start + 0.062);
+    g.gain.linearRampToValueAtTime(0, start + 0.07);
+    osc.connect(g).connect(audioCtx.destination);
+    osc.start(start);
+    osc.stop(start + 0.08);
+  }
+}
 
-  const freqRow = makeEl("div", "freq-row");
-  const freqInput = document.createElement("input");
-  freqInput.className = "freq-input";
-  freqInput.type = "number";
-  freqInput.step = "any";
-  freqInput.value = scalarGet(ch, "freq", 0);
-  freqInput.oninput = () => {
-    const n = parseFloat(freqInput.value);
-    scalarSet(ch, "freq", "float", Number.isNaN(n) ? 0 : n);
-  };
-  freqRow.appendChild(freqInput);
-  freqRow.appendChild(makeEl("span", "unit", "MHz"));
-  const modSelect = document.createElement("select");
-  modSelect.className = "mod-select";
-  [["nfm", "NFM (FM voice)"], ["am", "AM"]].forEach(([value, label]) => {
-    const opt = document.createElement("option");
-    opt.value = value;
-    opt.textContent = label;
-    modSelect.appendChild(opt);
+// ---------- player ----------
+
+const audio = $("#audio");
+let playing = null; // recording being played
+
+function playRecording(rec, offset = 0) {
+  if (playing && playing.path === rec.path) {
+    if (offset) audio.currentTime = offset;
+    audio.paused ? audio.play() : offset ? null : audio.pause();
+    return;
+  }
+  playing = rec;
+  audio.src = "/audio/" + encodePath(rec.path);
+  audio.playbackRate = Number($("#player-speed").value);
+  audio.onloadedmetadata = () => { if (offset) audio.currentTime = offset; drawMarks(); };
+  audio.play().catch((e) => toast(`Can't play this file: ${e.message}`, true));
+  $("#player").classList.remove("hidden");
+  const f = station && station.frequencies.find((x) => fmtMhz(x.mhz) === rec.freq);
+  $("#player-title").innerHTML = `<b>${esc(rec.freq)}</b>${esc(rec.net || (f ? label(f) : ""))} · ${new Date(rec.start_unix * 1000).toLocaleDateString()} ${clock(rec.start_unix)}`;
+  drawMarks();
+}
+
+function drawMarks() {
+  const total = audio.duration || (playing && playing.duration_sec) || 0;
+  $("#player-marks").innerHTML = !playing || !total ? "" : playing.overs.slice(1).map((o) => `<b style="left:${(o.offset_sec / total) * 100}%"></b>`).join("");
+}
+
+function syncPlayButtons() {
+  $$("[data-play]").forEach((b) => {
+    const on = playing && b.dataset.play === playing.path && !audio.paused;
+    b.classList.toggle("playing", on);
+    b.innerHTML = on ? ICON.pause : ICON.play;
+    b.setAttribute("aria-label", on ? "Pause" : "Play");
+    const row = b.closest(".rec");
+    if (row) row.classList.toggle("current", !!playing && b.dataset.play === playing.path);
   });
-  // RTLSDR-Airband defaults to AM when the field is absent - reflect that
-  // truthfully instead of silently writing "nfm" into a config that never had it.
-  modSelect.value = scalarGet(ch, "modulation", "am");
-  modSelect.onchange = () => scalarSet(ch, "modulation", "string", modSelect.value);
-  freqRow.appendChild(modSelect);
-  card.appendChild(freqRow);
-
-  const fieldsWrap = makeEl("div", "card-fields");
-  fieldsWrap.appendChild(makeSquelchField(ch));
-  card.appendChild(fieldsWrap);
-
-  if (!Array.isArray(ch.outputs)) ch.outputs = [];
-  const freqNow = scalarGet(ch, "freq", 0);
-  if (ch.outputs.length === 0) ch.outputs.push(makeDefaultFileOutput(nameInput.value || `Frequency ${idx + 1}`, freqNow));
-
-  // File and Icecast are independent toggles, not either/or - the engine
-  // happily writes both from one channel (see the "+N more outputs" note
-  // elsewhere for other output types, e.g. the live-listening udp_stream one).
-  const findOutput = (type) => ch.outputs.find((o) => scalarGet(o, "type", "") === type);
-  const fileOutput = findOutput("file");
-  const icecastOutput = findOutput("icecast");
-
-  const typeRow = makeEl("div", "output-type-row");
-  const fileBtn = document.createElement("button");
-  fileBtn.type = "button";
-  fileBtn.textContent = "Record to file";
-  fileBtn.className = fileOutput ? "selected" : "";
-  fileBtn.onclick = () => {
-    if (fileOutput) ch.outputs.splice(ch.outputs.indexOf(fileOutput), 1);
-    else ch.outputs.push(makeDefaultFileOutput(nameInput.value || `Frequency ${idx + 1}`, freqNow));
-    renderRepeatersTab();
-  };
-  const icecastBtn = document.createElement("button");
-  icecastBtn.type = "button";
-  icecastBtn.textContent = "Stream to Icecast";
-  icecastBtn.className = icecastOutput ? "selected" : "";
-  icecastBtn.onclick = () => {
-    if (icecastOutput) ch.outputs.splice(ch.outputs.indexOf(icecastOutput), 1);
-    else ch.outputs.push(makeDefaultIcecastOutput());
-    renderRepeatersTab();
-  };
-  typeRow.appendChild(fileBtn);
-  typeRow.appendChild(icecastBtn);
-  card.appendChild(typeRow);
-
-  const recognizedCount = (fileOutput ? 1 : 0) + (icecastOutput ? 1 : 0) + (findUdpOutput(ch) ? 1 : 0);
-  if (ch.outputs.length > recognizedCount) {
-    card.appendChild(makeEl("p", "muted", `+${ch.outputs.length - recognizedCount} more output(s) on this channel — edit in Advanced tab`));
-  }
-
-  if (fileOutput) {
-    const fileFields = makeEl("div", "card-fields");
-    fileFields.appendChild(makeTextField("Directory", fileOutput, "directory", true));
-    fileFields.appendChild(makeTextField("Filename prefix", fileOutput, "filename_template", true));
-    const resetRow = makeEl("div", "field full");
-    const resetBtn = document.createElement("button");
-    resetBtn.type = "button";
-    resetBtn.textContent = "↻ Use frequency-based directory + filename";
-    resetBtn.title = "Recomputes Directory and Filename prefix from this card's current frequency and name - only runs when you click it, never silently";
-    resetBtn.onclick = () => {
-      ch.outputs[ch.outputs.indexOf(fileOutput)] = makeDefaultFileOutput(nameInput.value || `Frequency ${idx + 1}`, freqNow);
-      renderRepeatersTab();
-    };
-    resetRow.appendChild(resetBtn);
-    fileFields.appendChild(resetRow);
-    card.appendChild(fileFields);
-  }
-
-  if (icecastOutput) {
-    const icecastFields = makeEl("div", "card-fields");
-    icecastFields.appendChild(makeTextField("Icecast server", icecastOutput, "server", true));
-    icecastFields.appendChild(makeNumberField("Port", icecastOutput, "port", "int"));
-    icecastFields.appendChild(makeTextField("Mountpoint", icecastOutput, "mountpoint"));
-    icecastFields.appendChild(makeTextField("Username", icecastOutput, "username"));
-    icecastFields.appendChild(makeTextField("Password", icecastOutput, "password"));
-    card.appendChild(icecastFields);
-  }
-
-  const liveBlock = makeEl("div", "live-block");
-  const liveLabel = document.createElement("label");
-  const liveToggle = document.createElement("input");
-  liveToggle.type = "checkbox";
-  liveToggle.checked = !!findUdpOutput(ch);
-  liveLabel.appendChild(liveToggle);
-  liveLabel.append(" Enable live listening (adds a UDP output — needs Save + Restart to take effect)");
-  liveToggle.onchange = () => { setLiveEnabled(ch, idx, liveToggle.checked); renderRepeatersTab(); };
-  liveBlock.appendChild(liveLabel);
-
-  if (findUdpOutput(ch)) {
-    const port = channelLivePort(ch, idx);
-    const existingSession = liveSessions[port];
-    const controls = makeEl("div", "live-controls");
-
-    const listenBtn = document.createElement("button");
-    listenBtn.type = "button";
-    listenBtn.textContent = existingSession ? "Stop listening" : "Listen live";
-
-    const volume = document.createElement("input");
-    volume.type = "range";
-    volume.min = "0";
-    volume.max = "1";
-    volume.step = "0.01";
-    volume.value = existingSession ? existingSession.lastVolume : 0.8;
-
-    const muteLabel = document.createElement("label");
-    const muteCb = document.createElement("input");
-    muteCb.type = "checkbox";
-    muteCb.checked = existingSession ? existingSession.muted : false;
-    muteLabel.appendChild(muteCb);
-    muteLabel.append(" Mute");
-
-    const statusEl = makeEl("span", "muted live-status", existingSession ? (existingSession.gotAudio ? "Live" : "Buffering…") : "Live listening off");
-    if (existingSession) existingSession.statusEl = statusEl;
-
-    listenBtn.onclick = () => {
-      if (liveSessions[port]) {
-        stopListening(port);
-      } else {
-        startListening(port, parseFloat(volume.value), muteCb.checked, statusEl);
-      }
-      renderRepeatersTab();
-    };
-    volume.oninput = () => {
-      const s = liveSessions[port];
-      if (!s) return;
-      s.lastVolume = parseFloat(volume.value);
-      s.gainNode.gain.value = s.muted ? 0 : s.lastVolume;
-    };
-    muteCb.onchange = () => {
-      const s = liveSessions[port];
-      if (!s) return;
-      s.muted = muteCb.checked;
-      s.gainNode.gain.value = s.muted ? 0 : s.lastVolume;
-    };
-
-    controls.appendChild(listenBtn);
-    controls.appendChild(makeEl("span", "muted", "Volume"));
-    controls.appendChild(volume);
-    controls.appendChild(muteLabel);
-    controls.appendChild(statusEl);
-    liveBlock.appendChild(controls);
-  }
-  card.appendChild(liveBlock);
-
-  return card;
+  const t = $("#player-toggle");
+  t.innerHTML = audio.paused ? ICON.play : ICON.pause;
+  t.setAttribute("aria-label", audio.paused ? "Play" : "Pause");
 }
 
-function renderRepeatersTab() {
-  const device = normalizeDevice();
-
-  const grid = document.getElementById("device-grid");
-  grid.innerHTML = "";
-  grid.appendChild(makeDeviceField("Device index", device, "index", "int"));
-  grid.appendChild(makeDeviceField("Gain · dB", device, "gain", "float"));
-  grid.appendChild(makeDeviceField("Center frequency · MHz", device, "centerfreq", "float"));
-  grid.appendChild(makeDeviceField("Correction · ppm", device, "correction", "int"));
-
-  const cardsEl = document.getElementById("repeater-cards");
-  cardsEl.innerHTML = "";
-  device.channels.forEach((ch, idx) => cardsEl.appendChild(makeRepeaterCard(device, ch, idx)));
-}
-
-document.getElementById("btn-add-frequency").addEventListener("click", () => {
-  const device = normalizeDevice();
-  const idx = device.channels.length;
-  device.channels.push({
-    freq: scalar("float", 0),
-    modulation: scalar("string", "nfm"),
-    outputs: [makeDefaultFileOutput(`Frequency ${idx + 1}`, 0)],
-  });
-  renderRepeatersTab();
+audio.addEventListener("play", syncPlayButtons);
+audio.addEventListener("pause", syncPlayButtons);
+audio.addEventListener("ended", syncPlayButtons);
+audio.addEventListener("timeupdate", () => {
+  const total = audio.duration || 0;
+  $("#player-done").style.width = total ? `${(audio.currentTime / total) * 100}%` : "0";
+  $("#player-time").textContent = `${dur(audio.currentTime)} / ${dur(total)}`;
+});
+$("#player-toggle").addEventListener("click", () => (audio.paused ? audio.play() : audio.pause()));
+$("#player-speed").addEventListener("change", (e) => { audio.playbackRate = Number(e.target.value); });
+$("#player-close").addEventListener("click", () => { audio.pause(); audio.removeAttribute("src"); playing = null; $("#player").classList.add("hidden"); syncPlayButtons(); });
+$("#player-seek").addEventListener("click", (e) => {
+  const r = e.currentTarget.getBoundingClientRect();
+  if (audio.duration) audio.currentTime = ((e.clientX - r.left) / r.width) * audio.duration;
+});
+$("#player-seek").addEventListener("keydown", (e) => {
+  if (e.key === "ArrowRight") audio.currentTime += 5;
+  if (e.key === "ArrowLeft") audio.currentTime -= 5;
 });
 
-// ================================================================
-// Advanced tab: generic recursive tree editor (fallback for anything
-// the Repeaters tab doesn't model: multiple devices, mixers, scan mode, ...)
-// ================================================================
-function getParent(root, path) {
-  let obj = root;
-  for (let i = 0; i < path.length - 1; i++) obj = obj[path[i]];
-  return obj;
-}
-function setAt(root, path, value) {
-  if (path.length === 0) return;
-  getParent(root, path)[path[path.length - 1]] = value;
-}
-function deleteAt(root, path) {
-  const parent = getParent(root, path);
-  const last = path[path.length - 1];
-  if (Array.isArray(parent)) parent.splice(last, 1);
-  else delete parent[last];
-}
-function getAtPath(root, path) {
-  let obj = root;
-  for (const p of path) obj = obj[p];
-  return obj;
+// ---------- monitor ----------
+
+function viewMonitor(main) {
+  if (!station.frequencies.length) {
+    main.innerHTML = `<div class="page"><div id="banners"></div><div class="panel empty" style="padding:64px 24px">
+      <h3>Add your first frequency</h3>
+      <p>Pick any frequency within about 2 MHz of the others, for example your local repeater's output.<br>Recording starts as soon as you add it.</p>
+      <p><a class="btn primary big" href="#/frequency/new">Add frequency</a></p></div></div>`;
+    return;
+  }
+  main.innerHTML = `<div class="page">
+    <div id="banners">${bannerHtml()}</div>
+    <section class="panel" aria-label="Band">
+      <div class="panel-head"><h2>Band</h2><span class="muted">Everything the dongle hears. A full waterfall needs an engine update and comes later.</span></div>
+      <div class="band" id="band"><div class="floor"></div></div>
+      <div class="band-scale" id="band-scale"></div>
+    </section>
+    <section class="tiles" aria-label="Frequencies">
+      ${station.frequencies.map(tileHtml).join("")}
+      <a class="add-tile" href="#/frequency/new">${ICON.plus}Add frequency<span class="faint">Anything inside the band shown above</span></a>
+    </section>
+    <section class="panel" aria-label="Latest recordings">
+      <div class="panel-head"><h2>Latest recordings</h2><span class="grow"></span><a href="#/recordings">See all</a></div>
+      <div id="latest"></div>
+    </section>
+  </div>`;
+  updateMonitorLive();
+  loadRecent(true).then(() => { if (route.name === "monitor") { fillMonitorRecordings(); } });
+  fillMonitorRecordings();
 }
 
-function renderRoot() {
-  const container = document.getElementById("visual-editor");
-  container.innerHTML = "";
-  renderObject(container, configData, [], "config root");
+function tileHtml(f) {
+  const mode = f.modulation === "am" ? "AM" : "FM";
+  return `<article class="tile" data-tile="${esc(f.id)}">
+    <div class="tile-head">
+      <span class="dot"></span><span class="name">${esc(label(f))}</span><span class="tag">${mode}</span>
+      ${f.ctcss_hz ? `<span class="tag">CTCSS ${f.ctcss_hz}</span>` : ""}${f.record ? "" : '<span class="tag">Not recorded</span>'}
+      <span class="tag amber hidden" data-netname></span>
+      <span class="grow"></span><span class="state" data-state>IDLE</span>
+      <a class="btn ghost icon" href="#/frequency/${encodeURIComponent(f.id)}" aria-label="Edit ${esc(label(f))}">${ICON.edit}</a>
+    </div>
+    <div><span class="freq">${fmtMhz(f.mhz)}</span><span class="unit">MHz</span></div>
+    <div style="display:flex;align-items:center;gap:10px">
+      <div class="meter" aria-hidden="true" style="flex:1"><i data-meter></i></div>
+      <span class="label" style="white-space:nowrap">Squelch</span>
+      <button class="btn icon" type="button" data-act="squelch" data-id="${esc(f.id)}" data-delta="-1" aria-label="Lower squelch for ${esc(label(f))}">−</button>
+      <b class="mono" data-squelch="${esc(f.id)}" style="width:14px;text-align:center">${f.squelch}</b>
+      <button class="btn icon" type="button" data-act="squelch" data-id="${esc(f.id)}" data-delta="1" aria-label="Raise squelch for ${esc(label(f))}">+</button>
+    </div>
+    <div class="strip" data-strip aria-label="Activity in the last 24 hours"></div>
+    <div class="strip-scale"><span>24 h ago</span><span>now</span></div>
+    <div class="tile-foot">
+      <button class="btn" type="button" data-act="listen" data-id="${esc(f.id)}">${ICON.headphones}<span>Listen</span></button>
+      <a href="#/recordings?freq=${encodeURIComponent(fmtMhz(f.mhz))}" data-clips></a>
+      <span class="grow"></span><span class="muted" data-heard style="font-size:12px"></span>
+    </div>
+  </article>`;
 }
 
-function renderObject(container, obj, path, label) {
-  const group = makeEl("div", "node-group");
-  group.appendChild(makeEl("div", "node-title", label));
-  renderObjectBody(group, obj, path);
-  container.appendChild(group);
-}
-
-function renderObjectBody(container, obj, path) {
-  Object.keys(obj).forEach((key) => {
-    const value = obj[key];
-    const childPath = [...path, key];
-    if (isScalar(value)) {
-      renderScalarRow(container, key, value, childPath);
-    } else if (isPlainObject(value) || Array.isArray(value)) {
-      const wrapper = makeEl("div");
-      const wrapTitle = makeEl("div", "node-title");
-      const nameSpan = makeEl("span", null, key + (Array.isArray(value) ? ` [${value.length}]` : ""));
-      const removeBtn = makeEl("button", "remove-btn", "✕");
-      removeBtn.onclick = () => { deleteAt(configData, childPath); renderRoot(); };
-      wrapTitle.appendChild(nameSpan);
-      wrapTitle.appendChild(removeBtn);
-      wrapper.appendChild(wrapTitle);
-      if (Array.isArray(value)) renderArrayBody(wrapper, value, childPath);
-      else renderObjectBody(wrapper, value, childPath);
-      container.appendChild(wrapper);
+function updateMonitorLive() {
+  if (!status || !station) return;
+  const plan = status.plan;
+  const band = $("#band");
+  if (band && plan) {
+    const span = plan.high_mhz - plan.low_mhz;
+    const pos = (m) => ((m - plan.low_mhz) / span) * 100;
+    if (!band.dataset.ready || band.dataset.ready !== JSON.stringify(plan)) {
+      band.dataset.ready = JSON.stringify(plan);
+      band.innerHTML = `<div class="floor"></div>` + station.frequencies.map((f) =>
+        `<div class="marker" data-marker="${esc(f.id)}" style="left:${pos(f.mhz)}%"><div class="flag">${fmtMhz(f.mhz)} ${esc(f.name || "")}</div><div class="glow"></div></div>`).join("");
+      const step = span / 5;
+      $("#band-scale").innerHTML = Array.from({ length: 6 }, (_, i) => `<span>${(plan.low_mhz + i * step).toFixed(2)}</span>`).join("");
     }
-  });
-  container.appendChild(makeAddFieldRow(path));
-}
-
-function renderArrayBody(container, arr, path) {
-  arr.forEach((item, idx) => {
-    const itemPath = [...path, idx];
-    const itemWrapper = makeEl("div", "list-item");
-    const header = makeEl("div", "list-item-header");
-    header.appendChild(makeEl("span", null, `#${idx}`));
-    const removeBtn = makeEl("button", "remove-btn", "✕");
-    removeBtn.onclick = () => { deleteAt(configData, itemPath); renderRoot(); };
-    header.appendChild(removeBtn);
-    itemWrapper.appendChild(header);
-    if (isScalar(item)) renderScalarRow(itemWrapper, null, item, itemPath, true);
-    else if (isPlainObject(item)) renderObjectBody(itemWrapper, item, itemPath);
-    else if (Array.isArray(item)) renderArrayBody(itemWrapper, item, itemPath);
-    container.appendChild(itemWrapper);
-  });
-
-  const addRow = makeEl("div", "add-row");
-  const addBtn = makeEl("button", null, "+ Add item");
-  addBtn.onclick = () => {
-    const clone = arr.length > 0 ? JSON.parse(JSON.stringify(arr[arr.length - 1])) : {};
-    arr.push(clone);
-    renderRoot();
-  };
-  addRow.appendChild(addBtn);
-  container.appendChild(addRow);
-}
-
-function renderScalarRow(container, key, scalarVal, path, isListScalar) {
-  const row = makeEl("div", "node-row");
-  if (!isListScalar) row.appendChild(makeEl("span", "key-label", key));
-
-  let input;
-  if (scalarVal.type === "bool") {
-    input = document.createElement("input");
-    input.type = "checkbox";
-    input.checked = !!scalarVal.value;
-    input.onchange = () => { scalarVal.value = input.checked; };
-  } else if (scalarVal.type === "int" || scalarVal.type === "float") {
-    input = document.createElement("input");
-    input.type = "number";
-    input.step = scalarVal.type === "int" ? "1" : "any";
-    input.value = scalarVal.value;
-    input.oninput = () => {
-      const n = scalarVal.type === "int" ? parseInt(input.value, 10) : parseFloat(input.value);
-      scalarVal.value = Number.isNaN(n) ? 0 : n;
-    };
-  } else {
-    input = document.createElement("input");
-    input.type = "text";
-    input.value = scalarVal.value === null ? "" : scalarVal.value;
-    input.oninput = () => { scalarVal.value = input.value; };
   }
-  row.appendChild(input);
-
-  const removeBtn = makeEl("button", "remove-btn", "✕");
-  removeBtn.onclick = () => { deleteAt(configData, path); renderRoot(); };
-  row.appendChild(removeBtn);
-  container.appendChild(row);
-}
-
-function makeAddFieldRow(path) {
-  const addRow = makeEl("div", "add-row");
-  const keyInput = document.createElement("input");
-  keyInput.type = "text";
-  keyInput.placeholder = "field name";
-  const typeSelect = document.createElement("select");
-  ["String", "Integer", "Float", "Boolean", "Group", "List"].forEach((t) => {
-    const opt = document.createElement("option");
-    opt.value = t;
-    opt.textContent = t;
-    typeSelect.appendChild(opt);
-  });
-  const addBtn = document.createElement("button");
-  addBtn.textContent = "+ Add field";
-  addBtn.onclick = () => {
-    const key = keyInput.value.trim();
-    if (!key) return;
-    const target = path.length === 0 ? configData : getAtPath(configData, path);
-    if (Object.prototype.hasOwnProperty.call(target, key)) {
-      alert(`Field "${key}" already exists`);
-      return;
+  for (const fs of status.frequencies) {
+    const tile = $(`[data-tile="${CSS.escape(fs.id)}"]`);
+    if (!tile) continue;
+    tile.classList.toggle("on", fs.on_air);
+    $("[data-state]", tile).textContent = fs.on_air ? "ON AIR" : "IDLE";
+    const level = fs.on_air && fs.level_dbfs != null ? Math.max(4, Math.min(100, ((fs.level_dbfs + 60) / 60) * 100)) : 0;
+    $("[data-meter]", tile).style.width = `${level}%`;
+    $("[data-heard]", tile).textContent = fs.on_air ? (fs.net ? `Recording ${fs.net}` : "Recording now") : ago(fs.last_heard_unix);
+    const netTag = $("[data-netname]", tile);
+    netTag.classList.toggle("hidden", !fs.net);
+    netTag.textContent = fs.net ? fs.net : "";
+    const marker = $(`[data-marker="${CSS.escape(fs.id)}"]`);
+    if (marker) {
+      marker.classList.toggle("on", fs.on_air);
+      $(".glow", marker).style.height = `${level * 0.7}%`;
     }
-    const defaults = {
-      String: scalar("string", ""),
-      Integer: scalar("int", 0),
-      Float: scalar("float", 0.0),
-      Boolean: scalar("bool", false),
-      Group: {},
-      List: [],
-    };
-    target[key] = defaults[typeSelect.value];
-    renderRoot();
-  };
-  addRow.appendChild(keyInput);
-  addRow.appendChild(typeSelect);
-  addRow.appendChild(addBtn);
-  return addRow;
-}
-
-// ================================================================
-// Config file load/save (shared by Repeaters + Advanced + Raw tabs)
-// ================================================================
-async function loadConfigList() {
-  const data = await api("/api/configs");
-  const select = document.getElementById("config-select");
-  select.innerHTML = "";
-  data.files.forEach((f) => {
-    const opt = document.createElement("option");
-    opt.value = f;
-    opt.textContent = f;
-    if (f === data.active) opt.selected = true;
-    select.appendChild(opt);
-  });
-}
-
-async function loadConfig() {
-  stopAllListening();
-  const data = await api("/api/config");
-  configData = data.data || {};
-  rawText = data.raw || "";
-  document.getElementById("raw-editor").value = rawText;
-  if (data.error) setMsg("save-msg", `Parse error in saved file: ${data.error}`, true);
-  renderRepeatersTab();
-  renderRoot();
-}
-
-document.getElementById("config-select").addEventListener("change", async (e) => {
-  await api("/api/configs/select", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ filename: e.target.value }),
-  });
-  await loadConfig();
-});
-
-document.getElementById("btn-new-config").addEventListener("click", async () => {
-  const name = window.prompt("New config filename (e.g. my_station.conf):");
-  if (!name) return;
-  try {
-    await api("/api/configs", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ filename: name }),
-    });
-    await loadConfigList();
-    const filename = name.endsWith(".conf") ? name : name + ".conf";
-    document.getElementById("config-select").value = filename;
-    await api("/api/configs/select", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ filename }),
-    });
-    await loadConfig();
-  } catch (err) {
-    alert(err.message);
-  }
-});
-
-// Shared by the header Save button and the Start/Restart buttons, which save
-// first - restarting the engine against a stale on-disk config is never what
-// you want, and saving unchanged content back is harmless.
-async function saveConfig() {
-  const data = await api("/api/config", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ data: configData }),
-  });
-  rawText = data.raw;
-  document.getElementById("raw-editor").value = rawText;
-}
-
-document.getElementById("btn-save").addEventListener("click", async () => {
-  try {
-    await saveConfig();
-    setMsg("save-msg", "Saved", false);
-  } catch (err) {
-    setMsg("save-msg", err.message, true);
-  }
-});
-
-document.getElementById("btn-validate-raw").addEventListener("click", async () => {
-  const raw = document.getElementById("raw-editor").value;
-  try {
-    const res = await api("/api/config/validate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ raw }),
-    });
-    setMsg("raw-save-msg", res.ok ? "Valid syntax" : res.error, !res.ok);
-  } catch (err) {
-    setMsg("raw-save-msg", err.message, true);
-  }
-});
-
-document.getElementById("btn-save-raw").addEventListener("click", async () => {
-  const raw = document.getElementById("raw-editor").value;
-  try {
-    await api("/api/config/raw", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ raw }),
-    });
-    setMsg("raw-save-msg", "Saved", false);
-    await loadConfig();
-  } catch (err) {
-    setMsg("raw-save-msg", err.message, true);
-  }
-});
-
-// ================================================================
-// Recordings tab
-// ================================================================
-function formatBytes(n) {
-  if (n > 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " MB";
-  return (n / 1024).toFixed(0) + " KB";
-}
-
-async function fetchAndRenderRecordings() {
-  const list = document.getElementById("recordings-list");
-  const meta = document.getElementById("recordings-meta");
-  list.textContent = "Loading…";
-  try {
-    const data = await api("/api/recordings");
-    if (!data.exists) {
-      meta.textContent = `Folder does not exist yet: ${data.base_dir} (it's created automatically once recording starts)`;
-    } else {
-      meta.textContent = `${data.recordings.length} clip(s) in ${data.base_dir}`;
+    const btn = $(`[data-act="listen"][data-id="${CSS.escape(fs.id)}"]`);
+    if (btn) {
+      const on = live && live.port === fs.port;
+      btn.classList.toggle("on", !!on);
+      btn.setAttribute("aria-pressed", on ? "true" : "false");
+      $("span", btn).textContent = on ? (fs.on_air ? "Listening" : "Listening · quiet") : "Listen";
     }
-    list.innerHTML = "";
-    if (data.recordings.length === 0) {
-      list.appendChild(makeEl("p", "muted", "No recordings yet."));
-      return;
-    }
-    let lastDate = null;
-    data.recordings.forEach((r) => {
-      if (r.date !== lastDate) {
-        list.appendChild(makeEl("h3", null, r.date));
-        lastDate = r.date;
-      }
-      const row = makeEl("div", "clip");
-      const info = makeEl("div", "clip-info");
-      info.appendChild(makeEl("strong", null, r.name));
-      info.appendChild(makeEl("small", null, `${formatBytes(r.bytes)} · ${new Date(r.mtime * 1000).toLocaleTimeString()}`));
-      row.appendChild(info);
-      const audio = document.createElement("audio");
-      audio.controls = true;
-      audio.preload = "none";
-      audio.src = "/audio/" + r.path.split("/").map(encodeURIComponent).join("/");
-      row.appendChild(audio);
-      const link = document.createElement("a");
-      link.href = audio.src;
-      link.download = r.name;
-      link.textContent = "Download";
-      row.appendChild(link);
-      const deleteBtn = document.createElement("button");
-      deleteBtn.className = "danger";
-      deleteBtn.textContent = "Delete";
-      deleteBtn.onclick = async () => {
-        if (!confirm(`Delete "${r.name}"? This cannot be undone.`)) return;
-        try {
-          await api(`/api/recordings/${r.path.split("/").map(encodeURIComponent).join("/")}`, { method: "DELETE" });
-          fetchAndRenderRecordings();
-        } catch (err) {
-          alert(err.message);
-        }
-      };
-      row.appendChild(deleteBtn);
-      list.appendChild(row);
-    });
-  } catch (err) {
-    list.textContent = "";
-    meta.textContent = err.message;
   }
 }
 
-document.getElementById("btn-refresh-recordings").addEventListener("click", fetchAndRenderRecordings);
-document.getElementById("btn-open-recordings-dir").addEventListener("click", async () => {
+function fillMonitorRecordings() {
+  const now = Date.now() / 1000, today = unixOf(startOfDay(new Date()));
+  for (const f of station.frequencies) {
+    const tile = $(`[data-tile="${CSS.escape(f.id)}"]`);
+    if (!tile) continue;
+    const mine = recent.filter((r) => r.freq === fmtMhz(f.mhz));
+    const marks = mine.flatMap((r) => (r.overs.length ? r.overs.map((o) => [o.start_unix, o.duration_sec]) : [[r.start_unix, r.duration_sec || 1]]));
+    $("[data-strip]", tile).innerHTML = marks
+      .filter(([s]) => s > now - 86400)
+      .map(([s, d]) => `<i style="left:${((s - (now - 86400)) / 86400) * 100}%;width:${Math.max(0.15, (d / 86400) * 100)}%"></i>`).join("");
+    const n = mine.filter((r) => r.start_unix >= today).length;
+    $("[data-clips]", tile).textContent = n === 1 ? "1 recording today" : `${n} recordings today`;
+  }
+  const latest = $("#latest");
+  if (latest) latest.innerHTML = recent.length ? recent.slice(0, 6).map(recRowHtml).join("") : `<div class="empty">Nothing recorded yet. Recordings appear here as soon as someone transmits.</div>`;
+  syncPlayButtons();
+}
+
+function oversBar(rec) {
+  const total = rec.duration_sec || 1;
+  return rec.overs.map((o) => `<i style="left:${(o.offset_sec / total) * 100}%;width:${(o.duration_sec / total) * 100}%"></i>`).join("");
+}
+
+function recRowHtml(rec, opts = {}) {
+  const f = station.frequencies.find((x) => fmtMhz(x.mhz) === rec.freq);
+  const who = rec.net || (f ? f.name : "") || "";
+  const n = rec.overs.length;
+  return `<div class="rec">
+    <button class="btn round" type="button" data-play="${esc(rec.path)}" aria-label="Play">${ICON.play}</button>
+    <span class="f">${esc(rec.freq)}</span>
+    <span class="t">${clock(rec.start_unix)}</span>
+    <span class="n">${esc(who)}${n > 1 ? ` · ${n} overs` : ""}</span>
+    <div class="overs">${oversBar(rec)}</div>
+    <span class="d">${rec.duration_sec != null ? dur(rec.duration_sec) : bytes(rec.bytes)}</span>
+    ${opts.actions ? `<button class="btn ghost icon" type="button" data-act="reveal" data-path="${esc(rec.path)}" aria-label="Show in folder">${ICON.folder}</button>
+      <button class="btn ghost icon" type="button" data-act="delete-rec" data-path="${esc(rec.path)}" aria-label="Delete">${ICON.trash}</button>` : ""}
+  </div>`;
+}
+
+// ---------- recordings ----------
+
+let recDay = startOfDay(new Date());
+let recList = [];
+
+function viewRecordings(main) {
+  const freqFilter = route.query.freq || "all";
+  main.innerHTML = `<div class="page">
+    <div id="banners">${bannerHtml()}</div>
+    <div class="page-head">
+      <h1>Recordings</h1><span class="grow"></span>
+      <button class="btn icon" type="button" data-act="day" data-delta="-1" aria-label="Previous day">${ICON.left}</button>
+      <input type="date" id="rec-date" value="${dateInput(recDay)}" aria-label="Day">
+      <button class="btn icon" type="button" data-act="day" data-delta="1" aria-label="Next day">${ICON.right}</button>
+      <button class="btn" type="button" data-act="day" data-delta="0">Today</button>
+      <button class="btn" type="button" data-act="reveal">${ICON.folder}Open folder</button>
+    </div>
+    <section class="panel" aria-label="Day timeline">
+      <div class="panel-head"><h2 id="day-title"></h2><span class="muted">Click a mark to hear it</span></div>
+      <div class="lanes" id="lanes"></div>
+      <div class="hours"><span>00</span><span>04</span><span>08</span><span>12</span><span>16</span><span>20</span><span>24</span></div>
+      <div style="height:12px"></div>
+    </section>
+    <div class="chips" role="group" aria-label="Show" id="rec-filters" data-filter="${esc(freqFilter)}"></div>
+    <div id="rec-nets" style="display:flex;flex-direction:column;gap:12px"></div>
+    <section class="panel" aria-label="Clips" id="rec-clips"></section>
+  </div>`;
+  $("#rec-date").addEventListener("change", (e) => { if (e.target.value) { recDay = startOfDay(new Date(e.target.value + "T00:00")); loadDay(); } });
+  loadDay();
+}
+
+async function loadDay() {
+  const from = unixOf(recDay), to = from + 86400;
+  $("#day-title").textContent = recDay.toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" });
+  $("#rec-date").value = dateInput(recDay);
   try {
-    await api("/api/recordings/open", { method: "POST" });
-  } catch (err) {
-    alert(err.message);
+    recList = (await api(`/api/recordings?from=${from}&to=${to}`)).recordings;
+  } catch (e) {
+    toast(e.message, true);
+    recList = [];
+  }
+  drawDay();
+}
+
+function drawDay() {
+  const from = unixOf(recDay);
+  const freqs = [...new Set([...station.frequencies.map((f) => fmtMhz(f.mhz)), ...recList.map((r) => r.freq).filter(Boolean)])];
+  $("#lanes").innerHTML = freqs.map((fq) => {
+    const recs = recList.filter((r) => r.freq === fq);
+    const f = station.frequencies.find((x) => fmtMhz(x.mhz) === fq);
+    const marks = recs.flatMap((r) => (r.overs.length ? r.overs : [{ start_unix: r.start_unix, duration_sec: r.duration_sec || 1, offset_sec: 0 }]).map((o) =>
+      `<i title="${clockSec(o.start_unix)}" data-act="play-at" data-path="${esc(r.path)}" data-offset="${o.offset_sec}" style="left:${((o.start_unix - from) / 86400) * 100}%;width:${Math.max(0.12, (o.duration_sec / 86400) * 100)}%"></i>`)).join("");
+    return `<div class="lane"><span class="who" title="${esc(f ? label(f) : fq)}">${esc(fq)}</span><div class="track">${marks}</div><span class="count">${recs.length} rec.</span></div>`;
+  }).join("") || `<div class="muted">No frequencies yet.</div>`;
+
+  const filter = $("#rec-filters").dataset.filter;
+  const opts = [["all", "All"], ...freqs.map((f) => [f, f]), ["nets", "Nets"]];
+  $("#rec-filters").innerHTML = opts.map(([v, t]) => `<button type="button" class="chip" data-act="rec-filter" data-value="${esc(v)}" aria-pressed="${v === filter}">${esc(t)}</button>`).join("");
+  const shown = recList.filter((r) => filter === "all" || (filter === "nets" ? r.net : r.freq === filter));
+  const nets = shown.filter((r) => r.net);
+  const clips = shown.filter((r) => !r.net);
+  $("#rec-nets").innerHTML = nets.map((r) => `<article class="net-card">
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+        <button class="btn round" type="button" data-play="${esc(r.path)}" aria-label="Play">${ICON.play}</button>
+        <div><div style="font-weight:600">${esc(r.net)}${r.freq ? ` · <span class="mono">${esc(r.freq)}</span>` : ""}</div>
+        <div class="muted" style="font-size:12px">${clock(r.start_unix)} · ${r.overs.length ? `${dur(r.duration_sec)} of speech, silences removed · ${r.overs.length} overs` : bytes(r.bytes)}</div></div>
+        <span class="grow"></span>
+        <button class="btn" type="button" data-act="reveal" data-path="${esc(r.path)}">${ICON.folder}Show in folder</button>
+        <button class="btn ghost icon" type="button" data-act="delete-rec" data-path="${esc(r.path)}" aria-label="Delete">${ICON.trash}</button>
+      </div>
+      <div class="overs">${oversBar(r)}${r.overs.slice(1).map((o) => `<b style="left:${(o.offset_sec / (r.duration_sec || 1)) * 100}%"></b>`).join("")}</div>
+    </article>`).join("");
+  $("#rec-clips").innerHTML = clips.length
+    ? clips.map((r) => recRowHtml(r, { actions: true })).join("")
+    : `<div class="empty">${recList.length ? "Nothing here with this filter." : "Nothing was recorded on this day."}</div>`;
+  if (!nets.length && filter === "nets") $("#rec-clips").innerHTML = `<div class="empty">No net was recorded on this day.</div>`;
+  syncPlayButtons();
+}
+
+// ---------- nets ----------
+
+function nextStart(net, now = new Date()) {
+  const [h, m] = net.start.split(":").map(Number);
+  for (let i = 0; i < 8; i++) {
+    const d = new Date(now);
+    d.setDate(d.getDate() + i);
+    d.setHours(h, m, 0, 0);
+    const wd = (d.getDay() + 6) % 7;
+    if (net.days.includes(wd) && d > now) return d;
+  }
+  return null;
+}
+
+function daysText(days) {
+  const s = [...days].sort();
+  if (s.length === 7) return "Every day";
+  if (s.join() === "0,1,2,3,4") return "Weekdays";
+  if (s.join() === "5,6") return "Weekends";
+  return s.map((d) => DAY_NAMES[d]).join(", ");
+}
+
+function viewNets(main) {
+  const o = station.recording;
+  main.innerHTML = `<div class="page">
+    <div id="banners">${bannerHtml()}</div>
+    <div class="page-head"><h1>Nets</h1><span class="muted">During a net, every over goes into one recording with the silences cut out.</span><span class="grow"></span>
+      <a class="btn primary" href="#/net/new">Add net</a></div>
+    ${station.nets.length ? `<section class="net-grid" id="net-grid">${station.nets.map(netTileHtml).join("")}</section>`
+      : `<div class="panel empty"><h3>No nets yet</h3><p>Add your morning or evening net and it's recorded as one file, ready to listen to or transcribe.</p></div>`}
+    <section class="panel" aria-label="How nets are recorded">
+      <div class="panel-head"><h2>How a net becomes one recording</h2></div>
+      <div class="panel-body">
+        <div class="form-grid">
+          <div class="field"><label for="net-gap">Keep one recording going through silences up to <b class="mono" id="net-gap-text">${o.net_join_sec} s</b></label>
+            <input type="range" id="net-gap" min="5" max="300" step="5" value="${o.net_join_sec}">
+            <span class="hint">A longer silence ends the recording; the next over starts a new one.</span></div>
+          <div class="field"><label for="net-overrun">If the net runs late, keep recording for up to</label>
+            <select id="net-overrun">${[0, 15, 30, 60, 120].map((v) => `<option value="${v}" ${v === o.net_overrun_max_min ? "selected" : ""}>${v ? v + " minutes" : "No extra time"}</option>`).join("")}</select>
+            <span class="hint">It stops sooner once the frequency goes quiet.</span></div>
+        </div>
+        <div class="row"><div class="text"><div class="title">Soft beep where each silence was cut</div><div class="sub">Two short quiet pips, so you can hear where one transmission ends and the next begins.</div></div>
+          <button class="btn" type="button" data-act="beep">Preview beep</button>
+          <button class="switch" type="button" role="switch" id="opt-beep" aria-checked="${o.gap_tone}" aria-label="Soft beep"></button></div>
+        <div class="row"><div class="text"><div class="title">Even out loudness</div><div class="sub">Weak and strong stations play at the same volume.</div></div>
+          <button class="switch" type="button" role="switch" id="opt-norm" aria-checked="${o.normalize}" aria-label="Even out loudness"></button></div>
+        <div class="hint">These also apply to everyday recordings. A list of the time of every over is always saved next to each recording, for transcripts.</div>
+        <div class="actions"><button class="btn primary" type="button" data-act="save-net-options">Save</button></div>
+      </div>
+    </section>
+  </div>`;
+  $("#net-gap").addEventListener("input", (e) => { $("#net-gap-text").textContent = `${e.target.value} s`; });
+  updateNetsLive();
+}
+
+function netTileHtml(n) {
+  const f = station.frequencies.find((x) => sameMhz(x.mhz, n.mhz));
+  return `<article class="net-tile" data-net="${esc(n.id)}">
+    <div style="display:flex;align-items:center;gap:10px"><span style="font-weight:600">${esc(n.name)}</span><span class="grow"></span><span class="tag" data-net-badge></span></div>
+    <div style="display:flex;align-items:baseline;gap:10px"><span class="when">${esc(n.start)} – ${esc(n.end)}</span><span class="mono" style="color:var(--amber)">${fmtMhz(n.mhz)}</span></div>
+    <div class="muted" style="font-size:12px">${esc(daysText(n.days))}${f && f.name ? " · " + esc(f.name) : ""}</div>
+    <div style="display:flex;gap:8px;align-items:center;margin-top:4px">
+      <a class="btn" href="#/net/${encodeURIComponent(n.id)}">${ICON.edit}Edit</a>
+      <a class="btn ghost" href="#/recordings?freq=nets">Recordings</a>
+      <span class="grow"></span>
+      <button class="switch" type="button" role="switch" data-act="toggle-net" data-id="${esc(n.id)}" aria-checked="${n.enabled}" aria-label="Record ${esc(n.name)}"></button>
+    </div>
+  </article>`;
+}
+
+function updateNetsLive() {
+  if (!status || !station) return;
+  for (const n of station.nets) {
+    const tile = $(`[data-net="${CSS.escape(n.id)}"]`);
+    if (!tile) continue;
+    const isLive = status.active_nets.includes(n.name);
+    tile.classList.toggle("live", isLive);
+    const badge = $("[data-net-badge]", tile);
+    const next = nextStart(n);
+    badge.className = "tag" + (isLive ? " amber" : "");
+    badge.textContent = isLive ? "RECORDING NOW" : !n.enabled ? "OFF" : next ? `NEXT ${next.toLocaleDateString([], { weekday: "short" }).toUpperCase()} ${n.start}` : "";
+  }
+}
+
+let netDraft = null;
+
+function viewNetEditor(main) {
+  const existing = station.nets.find((n) => n.id === route.arg);
+  if (!station.frequencies.length) {
+    main.innerHTML = `<div class="page narrow"><div class="panel empty"><h3>Add a frequency first</h3><p>A net is recorded on one of your frequencies.</p><p><a class="btn primary" href="#/frequency/new">Add frequency</a></p></div></div>`;
+    return;
+  }
+  netDraft = existing ? clone(existing) : { id: "", name: "", mhz: station.frequencies[0].mhz, days: [0, 1, 2, 3, 4, 5, 6], start: "07:00", end: "08:00", enabled: true };
+  const d = netDraft;
+  main.innerHTML = `<div class="page narrow">
+    <div class="page-head"><a class="btn icon" href="#/nets" aria-label="Back to nets">${ICON.left}</a><h1>${existing ? "Edit net" : "Add a net"}</h1></div>
+    <section class="panel"><div class="panel-body">
+      <div class="form-grid">
+        <div class="field"><label for="net-name">Name</label><input type="text" id="net-name" value="${esc(d.name)}" placeholder="Morning net" maxlength="40"><span class="hint">Used for the recording's folder and file name.</span></div>
+        <div class="field"><label for="net-freq">Frequency</label><select id="net-freq">${station.frequencies.map((f) => `<option value="${f.mhz}" ${sameMhz(f.mhz, d.mhz) ? "selected" : ""}>${fmtMhz(f.mhz)} MHz${f.name ? " · " + esc(f.name) : ""}</option>`).join("")}</select></div>
+        <div class="field"><label for="net-start">Starts</label><input type="time" id="net-start" value="${esc(d.start)}"></div>
+        <div class="field"><label for="net-end">Ends</label><input type="time" id="net-end" value="${esc(d.end)}"><span class="hint">An end before the start means it runs past midnight.</span></div>
+      </div>
+      <div class="field"><span class="label" id="days-label">Days</span>
+        <div class="days" role="group" aria-labelledby="days-label">${DAY_NAMES.map((n, i) => `<button type="button" data-act="net-day" data-day="${i}" aria-pressed="${d.days.includes(i)}">${n}</button>`).join("")}</div></div>
+      <div class="actions">
+        <button class="btn primary big" type="button" data-act="save-net">${existing ? "Save" : "Add net"}</button>
+        <a class="btn big" href="#/nets">Cancel</a><span class="grow"></span>
+        ${existing ? `<button class="btn danger" type="button" data-act="delete-net">${ICON.trash}Delete net</button>` : ""}
+      </div>
+    </div></section>
+  </div>`;
+}
+
+// ---------- frequency editor ----------
+
+let freqDraft = null;
+let planTimer = null;
+
+function stopEditorTimers() { clearTimeout(planTimer); }
+
+function viewFrequency(main) {
+  const existing = route.arg && route.arg !== "new" ? station.frequencies.find((f) => f.id === route.arg) : null;
+  freqDraft = existing ? clone(existing) : { id: "", mhz: Number(route.query.mhz) || null, name: "", modulation: "nfm", squelch: 5, record: true, ctcss_hz: null };
+  const d = freqDraft;
+  const tones = ctcssTones.map((t) => `<option value="${t}" ${d.ctcss_hz != null && Math.abs(d.ctcss_hz - t) < 0.05 ? "selected" : ""}>${t.toFixed(1)} Hz</option>`).join("");
+  main.innerHTML = `<div class="page narrow">
+    <div class="page-head"><a class="btn icon" href="#/monitor" aria-label="Back to monitor">${ICON.left}</a><h1>${existing ? "Edit frequency" : "Add a frequency"}</h1></div>
+    <section class="panel" aria-label="Where it sits in the receiver window"><div class="panel-body">
+      <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap"><span class="label">Receiver window</span><span class="hint" id="fit-text"></span></div>
+      <div class="fit" id="fit"></div><div class="fit-scale" id="fit-scale"></div>
+    </div></section>
+    <section class="panel"><div class="panel-body">
+      <div class="form-grid">
+        <div class="field"><label for="f-mhz">Frequency (MHz)</label>
+          <input type="text" id="f-mhz" inputmode="decimal" class="mono" style="height:56px;font-size:26px;color:var(--amber-hi)" value="${d.mhz ? fmtMhz(d.mhz) : ""}" placeholder="145.400" autocomplete="off">
+          <span class="hint" id="f-mhz-hint">A repeater's output frequency, as on your radio.</span></div>
+        <div class="field"><label for="f-name">Name</label><input type="text" id="f-name" maxlength="40" value="${esc(d.name)}" placeholder="Repeater A" style="height:56px;font-size:16px"><span class="hint">Shown on the dashboard. Optional.</span></div>
+        <div class="field"><span class="label" id="mode-label">Mode</span>
+          <div class="seg" role="group" aria-labelledby="mode-label"><button type="button" data-act="mode" data-mode="nfm" aria-pressed="${d.modulation !== "am"}">FM</button><button type="button" data-act="mode" data-mode="am" aria-pressed="${d.modulation === "am"}">AM</button></div>
+          <span class="hint">FM for ham repeaters and simplex. AM for aviation.</span></div>
+        <div class="field"><label for="f-sq">Squelch · <b id="f-sq-text">${d.squelch}</b></label>
+          <input type="range" id="f-sq" min="1" max="9" step="1" value="${d.squelch}">
+          <span class="hint">Like the SQL knob on a handheld: higher needs a stronger signal to start recording. 5 suits most repeaters.</span></div>
+        <div class="field"><label for="f-ctcss">Only record with this CTCSS tone</label>
+          <select id="f-ctcss"><option value="">Any signal</option>${tones}</select>
+          <span class="hint">Ignores other stations on the same frequency. Use your repeater's tone.</span></div>
+        <div class="field"><span class="label">Save recordings</span>
+          <div style="display:flex;align-items:center;gap:12px;height:40px"><button class="switch" type="button" role="switch" id="f-record" aria-checked="${d.record}" aria-label="Save recordings"></button><span class="hint">Off: listen live only.</span></div></div>
+      </div>
+      <div class="actions">
+        <button class="btn primary big" type="button" data-act="save-freq">${existing ? "Save" : "Add frequency"}</button>
+        <a class="btn big" href="#/monitor">Cancel</a><span class="grow"></span>
+        ${existing ? `<button class="btn danger" type="button" data-act="delete-freq">${ICON.trash}Delete</button>` : ""}
+      </div>
+      <div class="hint">Saving restarts the recorder, which takes about two seconds.</div>
+    </div></section>
+  </div>`;
+  $("#f-mhz").addEventListener("input", () => { schedulePlan(); });
+  $("#f-sq").addEventListener("input", (e) => { $("#f-sq-text").textContent = e.target.value; });
+  schedulePlan(0);
+  if (!existing) $("#f-mhz").focus();
+}
+
+function readMhz() {
+  const v = $("#f-mhz").value.trim().replace(",", ".");
+  const n = Number(v);
+  return v && isFinite(n) && n > 0 ? n : null;
+}
+
+function schedulePlan(delay = 250) {
+  clearTimeout(planTimer);
+  planTimer = setTimeout(drawFit, delay);
+}
+
+async function drawFit() {
+  const mhz = readMhz();
+  const others = station.frequencies.filter((f) => f.id !== freqDraft.id).map((f) => f.mhz);
+  const list = mhz ? [...others, mhz] : others;
+  const fit = $("#fit");
+  if (!fit) return;
+  if (!list.length) {
+    fit.innerHTML = "";
+    $("#fit-scale").innerHTML = "";
+    $("#fit-text").textContent = "Type a frequency";
+    $("#fit-text").className = "hint";
+    return;
+  }
+  let plan;
+  try { plan = (await api("/api/plan", { method: "POST", body: { mhz: list } })).plan; } catch { return; }
+  const lo = plan.low_mhz - 0.2, hi = plan.high_mhz + 0.2, span = hi - lo;
+  const pos = (m) => Math.max(0, Math.min(100, ((m - lo) / span) * 100));
+  const state = mhz ? plan.fits[plan.fits.length - 1] : null;
+  fit.innerHTML = `<div class="window" style="left:${pos(plan.low_mhz)}%;right:${100 - pos(plan.high_mhz)}%"></div>`
+    + others.map((m) => `<div class="tick" style="left:${pos(m)}%"></div>`).join("")
+    + (mhz ? `<div class="tick new ${state === "outside" ? "bad" : ""}" style="left:${pos(mhz)}%"></div>` : "");
+  $("#fit-scale").innerHTML = `<span>${plan.low_mhz.toFixed(2)}</span><span>centre ${fmtMhz(plan.centre_mhz)}</span><span>${plan.high_mhz.toFixed(2)}</span>`;
+  const t = $("#fit-text");
+  if (!mhz) { t.textContent = "Type a frequency"; t.className = "hint"; return; }
+  if (others.some((m) => sameMhz(m, mhz))) { t.textContent = "You already have this frequency."; t.className = "hint bad"; return; }
+  t.textContent = { good: "Fits in the receiver window", edge: "Fits, but near the edge where reception is weaker", outside: "Too far from your other frequencies for one dongle" }[state];
+  t.className = "hint " + { good: "good", edge: "edge", outside: "bad" }[state];
+}
+
+// ---------- settings ----------
+
+function viewSettings(main) {
+  const s = station.settings, r = station.receiver, o = station.recording;
+  const opt = (vals, cur, fmt) => vals.map((v) => `<option value="${v}" ${v === cur ? "selected" : ""}>${fmt(v)}</option>`).join("");
+  const dir = status ? status.recordings_dir : "";
+  main.innerHTML = `<div class="page narrow">
+    <div id="banners">${bannerHtml()}</div>
+    <div class="page-head"><h1>Settings</h1></div>
+    <section class="panel" aria-label="Where recordings go"><div class="panel-head"><h2>Where recordings go</h2></div><div class="panel-body">
+      <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">
+        <div class="mono" style="flex:1 1 320px;min-width:0;padding:11px 14px;border-radius:8px;border:1px solid var(--line-2);background:var(--inset);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(dir)}">${esc(dir)}</div>
+        <button class="btn" type="button" data-act="reveal">${ICON.folder}Open in Explorer</button>
+        <button class="btn" type="button" data-act="pick-folder">Change…</button>
+        ${s.recordings_dir ? `<button class="btn ghost" type="button" data-act="reset-folder">Use the default</button>` : ""}
+      </div>
+      <div class="hint" id="folder-state"></div>
+      <div class="mono hint" style="line-height:1.7">145.400\\2026\\11\\12\\145.400_20261112_070201.mp3<br>Nets\\Morning net\\2026\\11\\12\\Morning net_20261112_070012.mp3<br>Each recording has a .segments.tsv next to it with the time of every over.</div>
+      <div class="field"><label for="s-retention">Delete everyday recordings older than</label>
+        <select id="s-retention" data-setting="retention_days" data-num>${opt([0, 30, 60, 90, 180, 365], s.retention_days, (v) => (v ? `${v} days` : "Never"))}</select>
+        <span class="hint">Net recordings are never deleted automatically.</span></div>
+    </div></section>
+
+    <section class="panel" aria-label="Behaviour"><div class="panel-body" style="padding-top:4px;padding-bottom:4px">
+      ${switchRow("autostart", "Start with Windows", info.autostart_available ? "Starts recording when you sign in, without opening the window." : "Available in the installed app.", s.autostart, !info.autostart_available)}
+      ${switchRow("close_to_tray", "Keep recording when the window is closed", "The app stays in the system tray. Right-click its icon to quit.", s.close_to_tray)}
+      ${switchRow("local_time", "Use local time in file names", "Off: UTC.", s.local_time)}
+      <div class="row"><div class="text"><div class="title">Warn me if nothing is heard for</div><div class="sub">Usually means the antenna or dongle has a problem.</div></div>
+        <select data-setting="silence_warning_hours" data-num aria-label="Silence warning">${opt([0, 6, 12, 24, 48, 72], s.silence_warning_hours, (v) => (v ? `${v} hours` : "Don't warn"))}</select></div>
+    </div></section>
+
+    <section class="panel" aria-label="Everyday recordings"><div class="panel-head"><h2>Everyday recordings</h2></div><div class="panel-body">
+      <div class="form-grid">
+        <div class="field"><label for="s-join">Put overs in the same recording when they're less than</label>
+          <select id="s-join" data-recording="clip_join_sec" data-num>${opt([3, 5, 10, 20, 30, 60], o.clip_join_sec, (v) => `${v} seconds apart`)}</select>
+          <span class="hint">So a short back-and-forth is one recording instead of many.</span></div>
+        <div class="field"><label for="s-min">Ignore transmissions shorter than</label>
+          <select id="s-min" data-recording="min_clip_sec" data-num>${opt([0, 0.5, 1, 2], o.min_clip_sec, (v) => (v ? `${v} s` : "Keep everything"))}</select>
+          <span class="hint">Drops kerchunks and squelch blips.</span></div>
+      </div>
+      <div class="hint">Beeps between overs and loudness evening are set on the <a href="#/nets">Nets</a> page.</div>
+    </div></section>
+
+    <section class="panel" aria-label="Receiver"><div class="panel-head"><h2>Receiver</h2><span class="muted">${status && status.plan ? `Tuned to ${fmtMhz(status.plan.centre_mhz)} MHz automatically` : ""}</span></div><div class="panel-body">
+      <div class="form-grid">
+        <div class="field"><label for="r-gain">Gain · <b id="r-gain-text">${r.gain_db}</b> dB</label><input type="range" id="r-gain" min="0" max="49.6" step="0.1" value="${r.gain_db}">
+          <span class="hint">Higher hears weaker stations but adds noise. 25–35 dB suits most antennas.</span></div>
+        <div class="field"><label for="r-ppm">Frequency correction (ppm)</label><input type="number" id="r-ppm" min="-200" max="200" step="1" value="${r.correction_ppm}">
+          <span class="hint">0 for an RTL-SDR Blog V3 or V4.</span></div>
+        <div class="field"><label for="r-index">Dongle number</label><input type="number" id="r-index" min="0" max="9" step="1" value="${r.device_index}">
+          <span class="hint">0 unless more than one is plugged in.</span></div>
+      </div>
+      <div class="actions"><button class="btn" type="button" data-act="save-receiver">Save receiver settings</button><span class="hint">Restarts the recorder.</span></div>
+    </div></section>
+
+    <section class="panel"><div class="panel-body">
+      <details id="engine-details"><summary>Recorder log and settings file</summary>
+        <div style="display:flex;flex-direction:column;gap:10px;margin-top:12px">
+          <pre class="log" id="engine-log">Loading…</pre>
+          <details><summary>Settings file the app wrote for the recorder</summary><pre class="log" id="engine-conf"></pre></details>
+        </div></details>
+      <div class="footer-credit">Frequency Recorder records with <a href="https://github.com/rtl-airband/RTLSDR-Airband" target="_blank" rel="noopener">RTLSDR-Airband</a> (GPL). Built by Ruchir · VU22PR, India · <a href="https://www.giar.org" target="_blank" rel="noopener">GIAR</a>. Recording radio traffic is regulated differently in each country: it's up to you to follow the rules where you are.</div>
+    </div></section>
+  </div>`;
+  $("#folder-state").textContent = status ? `${status.recordings_dir_exists ? "Folder ready" : "Folder will be created"} · recordings use ${bytes(status.disk.used_bytes)}${status.disk.free_bytes != null ? " · " + bytes(status.disk.free_bytes) + " free on this drive" : ""}` : "";
+  $("#r-gain").addEventListener("input", (e) => { $("#r-gain-text").textContent = e.target.value; });
+  $("#engine-details").addEventListener("toggle", async (e) => {
+    if (!e.target.open) return;
+    try {
+      const log = await api("/api/engine/log");
+      $("#engine-log").textContent = log.lines.slice(-300).join("\n") || "Nothing logged yet.";
+      $("#engine-conf").textContent = log.config || "Not written yet.";
+    } catch (err) { $("#engine-log").textContent = err.message; }
+  });
+}
+
+function switchRow(key, title, sub, on, disabled = false) {
+  return `<div class="row"><div class="text"><div class="title">${esc(title)}</div><div class="sub">${esc(sub)}</div></div>
+    <button class="switch" type="button" role="switch" data-act="setting-switch" data-key="${key}" aria-checked="${!!on}" aria-label="${esc(title)}" ${disabled ? "disabled" : ""}></button></div>`;
+}
+
+// ---------- actions ----------
+
+let squelchTimer = null;
+
+const actions = {
+  squelch(el) {
+    const f = station.frequencies.find((x) => x.id === el.dataset.id);
+    if (!f) return;
+    f.squelch = Math.max(1, Math.min(9, f.squelch + Number(el.dataset.delta)));
+    $(`[data-squelch="${CSS.escape(f.id)}"]`).textContent = f.squelch;
+    clearTimeout(squelchTimer);
+    squelchTimer = setTimeout(() => saveStation(clone(station), `Squelch ${f.squelch} on ${label(f)}`), 1200);
+  },
+  async listen(el) {
+    const fs = status && status.frequencies.find((x) => x.id === el.dataset.id);
+    if (!fs) return;
+    if (live && live.port === fs.port) stopLive(); else startLive(fs.port);
+    updateMonitorLive();
+  },
+  async day(el) {
+    const delta = Number(el.dataset.delta);
+    recDay = delta ? startOfDay(new Date(recDay.getTime() + delta * 86400000 + 3600000)) : startOfDay(new Date());
+    loadDay();
+  },
+  "rec-filter"(el) { $("#rec-filters").dataset.filter = el.dataset.value; drawDay(); },
+  "play-at"(el) {
+    const rec = recList.find((r) => r.path === el.dataset.path);
+    if (rec) playRecording(rec, Number(el.dataset.offset) || 0.01);
+  },
+  async reveal(el) {
+    try { await api("/api/reveal", { method: "POST", body: el.dataset.path ? { path: el.dataset.path } : {} }); } catch (e) { toast(e.message, true); }
+  },
+  async "delete-rec"(el) {
+    const path = el.dataset.path;
+    if (!confirm(`Delete this recording for good?\n\n${path}`)) return;
+    try {
+      await api(`/api/recordings/${encodePath(path)}`, { method: "DELETE" });
+      if (playing && playing.path === path) $("#player-close").click();
+      recList = recList.filter((r) => r.path !== path);
+      recent = recent.filter((r) => r.path !== path);
+      if (route.name === "recordings") drawDay(); else fillMonitorRecordings();
+      toast("Deleted");
+    } catch (e) { toast(e.message, true); }
+  },
+  beep() { previewBeep(); },
+  async "save-net-options"() {
+    const next = clone(station);
+    next.recording.net_join_sec = Number($("#net-gap").value);
+    next.recording.net_overrun_max_min = Number($("#net-overrun").value);
+    next.recording.gap_tone = $("#opt-beep").getAttribute("aria-checked") === "true";
+    next.recording.normalize = $("#opt-norm").getAttribute("aria-checked") === "true";
+    await saveStation(next);
+  },
+  async "toggle-net"(el) {
+    const next = clone(station);
+    const n = next.nets.find((x) => x.id === el.dataset.id);
+    n.enabled = !n.enabled;
+    if (await saveStation(next, n.enabled ? `${n.name} will be recorded` : `${n.name} won't be recorded`)) render();
+  },
+  "net-day"(el) {
+    const day = Number(el.dataset.day);
+    const on = el.getAttribute("aria-pressed") !== "true";
+    el.setAttribute("aria-pressed", on);
+    netDraft.days = on ? [...netDraft.days, day].sort() : netDraft.days.filter((d) => d !== day);
+  },
+  async "save-net"() {
+    const d = netDraft;
+    d.name = $("#net-name").value.trim();
+    d.mhz = Number($("#net-freq").value);
+    d.start = $("#net-start").value;
+    d.end = $("#net-end").value;
+    const next = clone(station);
+    const i = next.nets.findIndex((n) => d.id && n.id === d.id);
+    if (i >= 0) next.nets[i] = d; else next.nets.push(d);
+    if (await saveStation(next, i >= 0 ? "Net saved" : "Net added")) location.hash = "#/nets";
+  },
+  async "delete-net"() {
+    if (!confirm(`Delete ${netDraft.name}? Its recordings stay in the folder.`)) return;
+    const next = clone(station);
+    next.nets = next.nets.filter((n) => n.id !== netDraft.id);
+    if (await saveStation(next, "Net deleted")) location.hash = "#/nets";
+  },
+  mode(el) {
+    freqDraft.modulation = el.dataset.mode;
+    $$('[data-act="mode"]').forEach((b) => b.setAttribute("aria-pressed", b === el));
+  },
+  async "save-freq"() {
+    const mhz = readMhz();
+    if (!mhz) { $("#f-mhz").classList.add("invalid"); $("#f-mhz-hint").textContent = "Type the frequency in MHz, like 145.400."; $("#f-mhz-hint").className = "hint bad"; $("#f-mhz").focus(); return; }
+    const d = freqDraft;
+    const oldMhz = d.mhz;
+    d.mhz = mhz;
+    d.name = $("#f-name").value.trim();
+    d.squelch = Number($("#f-sq").value);
+    d.ctcss_hz = $("#f-ctcss").value ? Number($("#f-ctcss").value) : null;
+    d.record = $("#f-record").getAttribute("aria-checked") === "true";
+    const next = clone(station);
+    const i = next.frequencies.findIndex((f) => d.id && f.id === d.id);
+    if (i >= 0) {
+      next.frequencies[i] = d;
+      if (oldMhz) next.nets.forEach((n) => { if (sameMhz(n.mhz, oldMhz)) n.mhz = mhz; });
+    } else next.frequencies.push(d);
+    if (await saveStation(next, i >= 0 ? "Saved" : `${fmtMhz(mhz)} MHz added. Recording starts in a few seconds.`)) location.hash = "#/monitor";
+  },
+  async "delete-freq"() {
+    const d = freqDraft;
+    const nets = station.nets.filter((n) => sameMhz(n.mhz, d.mhz));
+    const extra = nets.length ? `\n\nThe ${nets.map((n) => n.name).join(", ")} net${nets.length > 1 ? "s" : ""} on it will be deleted too.` : "";
+    if (!confirm(`Stop recording ${label(d)}? Its recordings stay in the folder.${extra}`)) return;
+    const next = clone(station);
+    next.frequencies = next.frequencies.filter((f) => f.id !== d.id);
+    next.nets = next.nets.filter((n) => !sameMhz(n.mhz, d.mhz));
+    if (await saveStation(next, "Frequency removed")) location.hash = "#/monitor";
+  },
+  async "setting-switch"(el) {
+    const next = clone(station);
+    next.settings[el.dataset.key] = !next.settings[el.dataset.key];
+    if (await saveStation(next)) el.setAttribute("aria-checked", next.settings[el.dataset.key]);
+  },
+  async "pick-folder"() {
+    try {
+      const res = await api("/api/pick-folder", { method: "POST" });
+      if (!res.path) return;
+      const next = clone(station);
+      next.settings.recordings_dir = res.path;
+      if (await saveStation(next, "New recordings go to the new folder. Existing ones stay where they are.")) { await pollStatus(); render(); }
+    } catch (e) { toast(e.message, true); }
+  },
+  async "reset-folder"() {
+    const next = clone(station);
+    next.settings.recordings_dir = "";
+    if (await saveStation(next)) { await pollStatus(); render(); }
+  },
+  async "save-receiver"() {
+    const next = clone(station);
+    next.receiver.gain_db = Number($("#r-gain").value);
+    next.receiver.correction_ppm = Math.round(Number($("#r-ppm").value) || 0);
+    next.receiver.device_index = Math.max(0, Math.round(Number($("#r-index").value) || 0));
+    await saveStation(next);
+  },
+};
+
+document.addEventListener("click", (e) => {
+  const play = e.target.closest("[data-play]");
+  if (play) {
+    const path = play.dataset.play;
+    const rec = [...recList, ...recent].find((r) => r.path === path);
+    if (rec) playRecording(rec);
+    return;
+  }
+  const sw = e.target.closest('.switch:not([data-act])');
+  if (sw && !sw.disabled) { sw.setAttribute("aria-checked", sw.getAttribute("aria-checked") !== "true"); return; }
+  const el = e.target.closest("[data-act]");
+  if (el && actions[el.dataset.act] && !el.disabled) actions[el.dataset.act](el);
+});
+
+document.addEventListener("change", async (e) => {
+  const el = e.target;
+  if (el.dataset.setting || el.dataset.recording) {
+    const next = clone(station);
+    const value = el.dataset.num !== undefined ? Number(el.value) : el.value;
+    if (el.dataset.setting) next.settings[el.dataset.setting] = value; else next.recording[el.dataset.recording] = value;
+    await saveStation(next);
   }
 });
-document.getElementById("btn-save-recordings-dir").addEventListener("click", async () => {
-  const dir = document.getElementById("recordings-dir").value;
-  await api("/api/settings", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ recordings_dir: dir }),
-  });
-  lastKnownRecordingsDir = dir;
-  fetchAndRenderRecordings();
-});
 
-// ================================================================
-// Tabs
-// ================================================================
-function activateTab(tabName) {
-  const btn = document.querySelector(`.tab-btn[data-tab="${tabName}"]`);
-  if (!btn) return;
-  document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
-  document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
-  btn.classList.add("active");
-  document.getElementById("tab-" + tabName).classList.add("active");
-  if (tabName === "process") startLogPolling();
-  else stopLogPolling();
-  // Repeaters and Advanced both edit the same configData in place, but each
-  // only re-renders itself on its own edits - re-render whichever tab we're
-  // entering so it picks up changes made from the other one.
-  if (tabName === "recordings") fetchAndRenderRecordings();
-  else if (tabName === "repeaters") renderRepeatersTab();
-  else if (tabName === "advanced") renderRoot();
-}
-
-document.querySelectorAll(".tab-btn").forEach((btn) => {
-  btn.addEventListener("click", () => activateTab(btn.dataset.tab));
-});
-
-// Inline links (e.g. "See Help for how to pick a center frequency") that jump
-// straight to another tab instead of naming it and leaving you to find it.
-document.querySelectorAll("[data-tab-link]").forEach((link) => {
-  link.addEventListener("click", (e) => {
-    e.preventDefault();
-    activateTab(link.dataset.tabLink);
-  });
-});
-
-// ================================================================
-// Theme
-// ================================================================
-function applyTheme(theme) {
-  if (theme === "light") {
-    document.documentElement.dataset.theme = "light";
-    document.getElementById("btn-theme-toggle").textContent = "☀️";
-  } else {
-    delete document.documentElement.dataset.theme;
-    document.getElementById("btn-theme-toggle").textContent = "🌙";
-  }
-}
-
-(function initTheme() {
-  let saved = null;
-  try { saved = localStorage.getItem("theme"); } catch (_e) { /* private browsing etc. */ }
-  applyTheme(saved === "light" ? "light" : "dark");
-})();
-
-document.getElementById("btn-theme-toggle").addEventListener("click", () => {
-  const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
-  applyTheme(next);
-  try { localStorage.setItem("theme", next); } catch (_e) { /* ignore */ }
-});
-
-// ================================================================
-// Process control
-// ================================================================
-async function loadSettings() {
-  const data = await api("/api/settings");
-  document.getElementById("binary-path").value = data.binary_path || "";
-  document.getElementById("recordings-dir").value = data.recordings_dir || lastKnownRecordingsDir;
-  document.getElementById("live-sample-rate").value = data.live_sample_rate || liveSampleRate;
-  lastKnownRecordingsDir = data.recordings_dir || lastKnownRecordingsDir;
-  liveSampleRate = data.live_sample_rate || liveSampleRate;
-  livePortBase = data.live_port_base || livePortBase;
-}
-
-document.getElementById("btn-save-binary").addEventListener("click", async () => {
-  await api("/api/settings", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ binary_path: document.getElementById("binary-path").value }),
-  });
-});
-
-document.getElementById("btn-save-live-rate").addEventListener("click", async () => {
-  const rate = parseInt(document.getElementById("live-sample-rate").value, 10) || 16000;
-  await api("/api/settings", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ live_sample_rate: rate }),
-  });
-  liveSampleRate = rate;
-});
-
-document.getElementById("btn-start").addEventListener("click", async () => {
-  logSince = 0;
-  document.getElementById("log-view").textContent = "";
+$("#btn-recording").addEventListener("click", async () => {
+  if (!status) return;
+  const enable = !status.recording_enabled;
+  if (!enable && !confirm("Stop recording? Nothing is recorded until you start it again.")) return;
   try {
-    await saveConfig();
-    await api("/api/process/start", { method: "POST" });
-  } catch (err) {
-    alert(err.message);
-  }
-  refreshStatus();
-});
-document.getElementById("btn-stop").addEventListener("click", async () => {
-  await api("/api/process/stop", { method: "POST" });
-  refreshStatus();
-});
-document.getElementById("btn-restart").addEventListener("click", async () => {
-  logSince = 0;
-  document.getElementById("log-view").textContent = "";
-  try {
-    await saveConfig();
-    await api("/api/process/restart", { method: "POST" });
-  } catch (err) {
-    alert(err.message);
-  }
-  refreshStatus();
+    await api("/api/recording", { method: "POST", body: { enabled: enable } });
+    toast(enable ? "Recording starts in a few seconds" : "Recording stopped");
+    pollStatus();
+  } catch (err) { toast(err.message, true); }
 });
 
-async function refreshStatus() {
-  const status = await api("/api/process/status");
-  const pill = document.getElementById("status-pill");
-  const procStatus = document.getElementById("proc-status");
-  document.getElementById("btn-start").disabled = status.running;
-  document.getElementById("btn-restart").disabled = !status.running;
-  document.getElementById("btn-stop").disabled = !status.running;
-  if (status.running) {
-    pill.textContent = `running · pid ${status.pid}`;
-    pill.className = "status-pill running";
-    procStatus.textContent = "";
-  } else {
-    pill.textContent = "stopped";
-    pill.className = "status-pill";
-    procStatus.textContent = status.last_exit_code !== null
-      ? `last exit code ${status.last_exit_code}`
-      : "";
-  }
-}
+// ---------- start ----------
 
-async function pollLogs() {
-  const data = await api(`/api/process/logs?since=${logSince}`);
-  if (data.lines.length) {
-    const view = document.getElementById("log-view");
-    view.textContent += data.lines.join("\n") + "\n";
-    view.scrollTop = view.scrollHeight;
-    logSince = data.next;
-  }
-}
-function startLogPolling() {
-  stopLogPolling();
-  pollLogs();
-  logPollTimer = setInterval(pollLogs, 2000);
-}
-function stopLogPolling() {
-  if (logPollTimer) clearInterval(logPollTimer);
-  logPollTimer = null;
-}
-
-// ================================================================
-// Init
-// ================================================================
 (async function init() {
-  await loadSettings();
-  await loadConfigList();
-  await loadConfig();
-  await refreshStatus();
-  setInterval(refreshStatus, 3000);
+  try {
+    const res = await api("/api/station");
+    station = res.station;
+    ctcssTones = res.ctcss_tones;
+    info = res;
+  } catch (e) {
+    $("#main").innerHTML = `<div class="page"><div class="banner">${esc(e.message)}</div></div>`;
+    return;
+  }
+  await pollStatus();
+  window.addEventListener("hashchange", render);
+  render();
+  setInterval(pollStatus, 1000);
+  setInterval(() => { if (route.name === "monitor") loadRecent().then(fillMonitorRecordings); }, 30000);
 })();

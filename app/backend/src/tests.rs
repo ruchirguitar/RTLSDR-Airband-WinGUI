@@ -3,28 +3,24 @@ use axum::http::Request;
 use http_body_util::BodyExt;
 
 struct Fixture {
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     app: Shared,
 }
 
 fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let configs = dir.path().join("configs");
-    std::fs::create_dir_all(&configs).unwrap();
-    std::fs::write(configs.join("basic_multichannel.conf"), "devices: ( { type = \"rtlsdr\"; centerfreq = 145.0; } );\n").unwrap();
     let ui = dir.path().join("ui");
-    std::fs::create_dir_all(ui.join("templates")).unwrap();
     std::fs::create_dir_all(ui.join("static")).unwrap();
-    std::fs::write(ui.join("templates/index.html"), "<html>hi</html>").unwrap();
+    std::fs::write(ui.join("index.html"), "<html>hi</html>").unwrap();
     std::fs::write(ui.join("static/app.js"), "// js").unwrap();
     let app = AppState::new(Paths {
         ui_dir: ui,
-        configs_dir: configs,
-        state_path: dir.path().join("state.json"),
+        data_dir: dir.path().join("data"),
         default_recordings_dir: dir.path().join("rec"),
-        default_binary: "rtl_airband".into(),
+        engine_binary: dir.path().join("no-such-engine.exe").to_string_lossy().into_owned(),
+        autostart_exe: None,
     });
-    Fixture { _dir: dir, app }
+    Fixture { dir, app }
 }
 
 async fn call(app: &Shared, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Vec<u8>) {
@@ -46,6 +42,16 @@ async fn call_json(app: &Shared, method: &str, uri: &str, body: Option<Value>) -
     (s, serde_json::from_slice(&b).unwrap_or(Value::Null))
 }
 
+fn two_repeaters() -> Value {
+    json!({
+        "frequencies": [
+            {"mhz": 145.4, "name": "Repeater A"},
+            {"mhz": 145.2, "name": "Repeater B", "squelch": 6}
+        ],
+        "nets": [{"name": "Morning net", "mhz": 145.4, "start": "07:00", "end": "08:00"}]
+    })
+}
+
 #[tokio::test]
 async fn serves_ui() {
     let f = fixture();
@@ -54,92 +60,118 @@ async fn serves_ui() {
 }
 
 #[tokio::test]
-async fn config_lifecycle() {
+async fn station_starts_empty_with_defaults() {
     let f = fixture();
-    let (s, v) = call_json(&f.app, "GET", "/api/configs", None).await;
+    let (s, v) = call_json(&f.app, "GET", "/api/station", None).await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(v["files"], json!(["basic_multichannel.conf"]));
-    assert_eq!(v["active"], json!("basic_multichannel.conf"));
-
-    let (_, v) = call_json(&f.app, "GET", "/api/config", None).await;
-    assert_eq!(v["data"]["devices"][0]["centerfreq"]["type"], json!("float"));
-
-    let mut data = v["data"].clone();
-    data["devices"][0]["gain"] = libconfig::scalar("int", json!(25));
-    let (s, v) = call_json(&f.app, "POST", "/api/config", Some(json!({"data": data}))).await;
-    assert_eq!(s, StatusCode::OK);
-    assert!(v["raw"].as_str().unwrap().contains("gain = 25;"));
-
-    let (s, _) = call_json(&f.app, "POST", "/api/configs", Some(json!({"filename": "net"}))).await;
-    assert_eq!(s, StatusCode::OK);
-    let (s, _) = call_json(&f.app, "POST", "/api/configs", Some(json!({"filename": "net"}))).await;
-    assert_eq!(s, StatusCode::CONFLICT);
-    let (s, _) = call_json(&f.app, "POST", "/api/configs", Some(json!({"filename": "../evil"}))).await;
-    assert_eq!(s, StatusCode::BAD_REQUEST);
-
-    call_json(&f.app, "POST", "/api/configs/select", Some(json!({"filename": "net.conf"}))).await;
-    let (_, v) = call_json(&f.app, "GET", "/api/config", None).await;
-    assert_eq!(v["filename"], json!("net.conf"));
+    assert_eq!(v["station"]["frequencies"], json!([]));
+    assert_eq!(v["station"]["recording"]["net_join_sec"], 60.0);
+    assert_eq!(v["station"]["settings"]["retention_days"], 90);
+    assert_eq!(v["autostart_available"], false);
+    assert!(v["ctcss_tones"].as_array().unwrap().len() >= 50);
 }
 
 #[tokio::test]
-async fn raw_config_is_validated_before_saving() {
+async fn station_is_validated_saved_and_reloaded() {
     let f = fixture();
-    let (s, v) = call_json(&f.app, "POST", "/api/config/raw", Some(json!({"raw": "a = ;"}))).await;
+    let (s, v) = call_json(&f.app, "PUT", "/api/station", Some(two_repeaters())).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let id = v["station"]["frequencies"][0]["id"].as_str().unwrap().to_string();
+    assert!(!id.is_empty(), "ids are filled in");
+    assert_eq!(v["station"]["frequencies"][1]["squelch"], 6);
+    assert_eq!(v["station"]["frequencies"][0]["squelch"], 5, "missing fields get defaults");
+
+    let again = AppState::new(f.app.paths.clone());
+    assert_eq!(again.station().frequencies[0].id, id, "persisted to station.json");
+
+    let mut bad = two_repeaters();
+    bad["frequencies"][1]["mhz"] = json!(150.0);
+    let (s, v) = call_json(&f.app, "PUT", "/api/station", Some(bad)).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
-    assert!(v["error"].as_str().unwrap().starts_with("Syntax error"));
-    let (_, v) = call_json(&f.app, "POST", "/api/config/validate", Some(json!({"raw": "a = 1;"}))).await;
-    assert_eq!(v["ok"], json!(true));
-    let (s, _) = call_json(&f.app, "POST", "/api/config/raw", Some(json!({"raw": "a = 1;"}))).await;
-    assert_eq!(s, StatusCode::OK);
+    assert!(v["error"].as_str().unwrap().contains("too far"), "{v}");
+    assert_eq!(f.app.station().frequencies[1].mhz, 145.2, "a rejected station is not saved");
 }
 
 #[tokio::test]
-async fn settings_persist() {
+async fn autostart_needs_the_installed_app() {
     let f = fixture();
-    call_json(&f.app, "POST", "/api/settings", Some(json!({"live_sample_rate": 8000, "binary_path": "x.exe"}))).await;
-    let (_, v) = call_json(&f.app, "GET", "/api/settings", None).await;
-    assert_eq!(v["live_sample_rate"], json!(8000));
-    assert_eq!(v["binary_path"], json!("x.exe"));
-    assert_eq!(v["live_port_base"], json!(LIVE_PORT_BASE));
+    let (s, v) = call_json(&f.app, "PUT", "/api/station", Some(json!({"settings": {"autostart": true}}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(v["error"].as_str().unwrap().contains("installed app"));
+}
+
+#[tokio::test]
+async fn plan_endpoint() {
+    let f = fixture();
+    let (_, v) = call_json(&f.app, "POST", "/api/plan", Some(json!({"mhz": [145.2, 145.4]}))).await;
+    assert_eq!(v["plan"]["centre_mhz"], 145.3);
+    assert_eq!(v["plan"]["fits"], json!(["good", "good"]));
+    let (_, v) = call_json(&f.app, "POST", "/api/plan", Some(json!({"mhz": []}))).await;
+    assert_eq!(v["plan"], Value::Null);
+}
+
+#[tokio::test]
+async fn status_and_recording_switch() {
+    let f = fixture();
+    let (_, v) = call_json(&f.app, "GET", "/api/status", None).await;
+    assert_eq!(v["state"], "setup");
+    assert_eq!(v["recording_enabled"], true);
+
+    call_json(&f.app, "PUT", "/api/station", Some(two_repeaters())).await;
+    let (_, v) = call_json(&f.app, "GET", "/api/status", None).await;
+    assert_eq!(v["state"], "waiting", "engine not running yet");
+    assert_eq!(v["frequencies"][1]["port"], 17301);
+    assert_eq!(v["frequencies"][0]["on_air"], false);
+    assert_eq!(v["plan"]["centre_mhz"], 145.3);
+    assert_eq!(v["recordings_dir_exists"], true, "created when the station is saved");
+
+    call_json(&f.app, "POST", "/api/recording", Some(json!({"enabled": false}))).await;
+    let (_, v) = call_json(&f.app, "GET", "/api/status", None).await;
+    assert_eq!(v["state"], "off");
+    assert!(!AppState::new(f.app.paths.clone()).recording_enabled(), "persisted");
+}
+
+#[tokio::test]
+async fn supervisor_reports_a_missing_engine() {
+    let f = fixture();
+    call_json(&f.app, "PUT", "/api/station", Some(two_repeaters())).await;
+    let app = f.app.clone();
+    tokio::task::spawn_blocking(move || supervisor::tick(&app, chrono::Local::now().naive_local())).await.unwrap();
+    let (_, v) = call_json(&f.app, "GET", "/api/status", None).await;
+    assert_eq!(v["state"], "waiting");
+    assert!(v["problem"].as_str().unwrap().contains("Could not start"), "{v}");
+    let conf = std::fs::read_to_string(f.dir.path().join("data/engine.conf")).unwrap();
+    assert!(conf.contains("centerfreq = 145.3;"), "{conf}");
+    assert!(f.dir.path().join("rec/Nets").is_dir());
 }
 
 #[tokio::test]
 async fn recordings_list_serve_delete() {
     let f = fixture();
-    let rec = f.app.recordings_dir();
-    std::fs::create_dir_all(rec.join("145.400/2026/09/30")).unwrap();
-    std::fs::write(rec.join("145.400/2026/09/30/a.mp3"), b"ID3").unwrap();
-    std::fs::write(rec.join("notes.txt"), b"x").unwrap();
+    let clip = f.dir.path().join("rec/145.400/2026/11/12/145.400_20261112_070201.mp3");
+    std::fs::create_dir_all(clip.parent().unwrap()).unwrap();
+    std::fs::write(&clip, b"ID3").unwrap();
+    std::fs::write(clip.with_file_name("145.400_20261112_070201.segments.tsv"), "start_sec\tend_sec\tstart_unix\tstart_utc\tfrequency_hz\n0.000\t2.000\t1794431093.0\tx\t145400000\n").unwrap();
 
     let (_, v) = call_json(&f.app, "GET", "/api/recordings", None).await;
-    assert_eq!(v["exists"], json!(true));
     let recs = v["recordings"].as_array().unwrap();
     assert_eq!(recs.len(), 1);
-    assert_eq!(recs[0]["path"], json!("145.400/2026/09/30/a.mp3"));
+    assert_eq!(recs[0]["freq"], "145.400");
+    assert_eq!(recs[0]["duration_sec"], 2.0);
+    let (_, v) = call_json(&f.app, "GET", "/api/recordings?from=1794431094", None).await;
+    assert_eq!(v["recordings"].as_array().unwrap().len(), 0);
 
-    assert_eq!(call(&f.app, "GET", "/audio/145.400/2026/09/30/a.mp3", None).await, (StatusCode::OK, b"ID3".to_vec()));
-    assert_eq!(call(&f.app, "GET", "/audio/..%2Fstate.json", None).await.0, StatusCode::FORBIDDEN);
-    assert_eq!(call(&f.app, "DELETE", "/api/recordings/../state.json", None).await.0, StatusCode::FORBIDDEN);
-
-    let (s, _) = call_json(&f.app, "DELETE", "/api/recordings/145.400/2026/09/30/a.mp3", None).await;
-    assert_eq!(s, StatusCode::OK);
-    assert!(!rec.join("145.400/2026/09/30/a.mp3").exists());
+    let path = "145.400/2026/11/12/145.400_20261112_070201.mp3";
+    assert_eq!(call(&f.app, "GET", &format!("/audio/{path}"), None).await, (StatusCode::OK, b"ID3".to_vec()));
+    assert_eq!(call(&f.app, "GET", "/audio/..%2F..%2Fsecret", None).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(call(&f.app, "DELETE", &format!("/api/recordings/{path}"), None).await.0, StatusCode::OK);
+    assert!(!clip.exists());
+    assert!(!clip.with_file_name("145.400_20261112_070201.segments.tsv").exists());
+    assert_eq!(call(&f.app, "DELETE", &format!("/api/recordings/{path}"), None).await.0, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn live_port_must_be_in_range() {
     let f = fixture();
     assert_eq!(call(&f.app, "GET", "/api/live/80/chunk", None).await.0, StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn process_start_reports_missing_binary() {
-    let f = fixture();
-    call_json(&f.app, "POST", "/api/settings", Some(json!({"binary_path": "/definitely/not/here"}))).await;
-    let (s, v) = call_json(&f.app, "POST", "/api/process/start", None).await;
-    assert_eq!(s, StatusCode::BAD_REQUEST);
-    assert!(v["error"].as_str().unwrap().contains("Could not start"));
-    let (_, v) = call_json(&f.app, "GET", "/api/process/status", None).await;
-    assert_eq!(v["running"], json!(false));
 }

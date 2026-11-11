@@ -4,14 +4,36 @@
 use std::collections::HashMap;
 use std::net::UdpSocket;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_BUFFERED_BYTES: usize = 16000 * 4 * 10; // ~10 s of mono float32 at 16 kHz
+/// The engine sends a batch every 1/8 s while squelch is open.
+const ON_AIR_TIMEOUT: Duration = Duration::from_millis(600);
 
 #[derive(Default)]
 struct Buffer {
     data: Vec<u8>,
     base_offset: u64, // stream offset of data[0]
+    last_packet: Option<Instant>,
+    last_heard_unix: Option<f64>,
+    level_dbfs: f32,
+}
+
+/// What a channel is doing, judged from the audio the engine sends.
+#[derive(Clone, Debug, serde::Serialize, PartialEq)]
+pub struct Activity {
+    pub on_air: bool,
+    pub level_dbfs: Option<f32>,
+    pub last_heard_unix: Option<f64>,
+}
+
+fn rms_dbfs(bytes: &[u8]) -> f32 {
+    let samples: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    if samples.is_empty() {
+        return -120.0;
+    }
+    let power = samples.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>() / samples.len() as f64;
+    (10.0 * power.max(1e-12).log10()) as f32
 }
 
 impl Buffer {
@@ -22,6 +44,14 @@ impl Buffer {
             self.data.drain(..trim);
             self.base_offset += trim as u64;
         }
+        self.last_packet = Some(Instant::now());
+        self.last_heard_unix = SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs_f64());
+        self.level_dbfs = rms_dbfs(bytes);
+    }
+
+    fn activity(&self) -> Activity {
+        let on_air = self.last_packet.is_some_and(|t| t.elapsed() < ON_AIR_TIMEOUT);
+        Activity { on_air, level_dbfs: on_air.then_some(self.level_dbfs), last_heard_unix: self.last_heard_unix }
     }
 
     fn read_since(&self, since: u64) -> (Vec<u8>, u64) {
@@ -64,6 +94,10 @@ impl LiveChannel {
 
     pub fn read_since(&self, since: u64) -> (Vec<u8>, u64) {
         self.buffer.lock().unwrap().read_since(since)
+    }
+
+    pub fn activity(&self) -> Activity {
+        self.buffer.lock().unwrap().activity()
     }
 }
 
@@ -114,5 +148,20 @@ mod tests {
         }
         assert_eq!(ch.read_since(0), (vec![9, 8, 7, 6], 4));
         assert!(Arc::ptr_eq(&ch, &mgr.get(port)));
+    }
+
+    #[test]
+    fn activity_follows_packets() {
+        let mut b = Buffer::default();
+        assert_eq!(b.activity(), Activity { on_air: false, level_dbfs: None, last_heard_unix: None });
+        let half: Vec<u8> = [0.5f32; 100].iter().flat_map(|s| s.to_le_bytes()).collect();
+        b.push(&half);
+        let a = b.activity();
+        assert!(a.on_air);
+        assert!((a.level_dbfs.unwrap() - (-6.02)).abs() < 0.1);
+        assert!(a.last_heard_unix.is_some());
+        b.last_packet = Some(Instant::now() - Duration::from_secs(2));
+        let a = b.activity();
+        assert!(!a.on_air && a.level_dbfs.is_none() && a.last_heard_unix.is_some());
     }
 }

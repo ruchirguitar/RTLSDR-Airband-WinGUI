@@ -498,7 +498,7 @@ freqs = [ 1.0, 2.0 ];
 
     #[test]
     fn parses_every_sample_config() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../configs");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../engine/config");
         let mut count = 0;
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();

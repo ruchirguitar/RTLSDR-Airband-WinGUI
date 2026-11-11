@@ -1,9 +1,9 @@
 [package]
 name = "airband-backend"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-description = "HTTP backend for the RTLSDR-Airband Windows GUI (port of engine/gui/app.py)"
+description = "HTTP backend and engine supervisor for Frequency Recorder"
 
 [dependencies]
 axum = "0.7"
@@ -14,6 +14,11 @@ serde_json = { version = "1", features = ["preserve_order"] }
 base64 = "0.22"
 tower = { version = "0.4", features = ["util"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+fs2 = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+rfd = "0.15"
+auto-launch = "0.5"
 
 [dev-dependencies]
 tempfile = "3"

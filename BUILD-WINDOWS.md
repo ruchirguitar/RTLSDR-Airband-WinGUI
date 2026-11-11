@@ -72,6 +72,17 @@ Installers land in `app\target\release\bundle\nsis\` (`.exe`) and `...\bundle\ms
 
 | What | Where |
 |---|---|
-| Configs (seeded from the samples on first run) | `%APPDATA%\org.frequencyrecorder.app\configs\` |
-| App settings | `%APPDATA%\org.frequencyrecorder.app\state.json` |
-| Recordings (default) | `Documents\Frequency Recordings\` |
+| Frequencies, nets and settings | `%APPDATA%\org.frequencyrecorder.app\station.json` |
+| Recording on/off switch | `%APPDATA%\org.frequencyrecorder.app\state.json` |
+| Engine config the app writes (don't edit) | `%APPDATA%\org.frequencyrecorder.app\engine.conf` |
+| Recordings (default, changeable in Settings) | `Documents\Frequency Recordings\<freq>\` and `...\Nets\<net name>\` |
+
+"Start with Windows" adds `Frequency Recorder --hidden` under
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`; turning it off removes it.
+
+To try the UI in a browser without Tauri (uses the dongle; data in `%TEMP%\frequency-recorder-dev`):
+
+```powershell
+cd RTLSDR-Airband-WinGUI\app
+cargo run -p airband-backend --example dev_server
+```

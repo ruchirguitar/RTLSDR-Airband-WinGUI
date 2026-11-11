@@ -1,9 +1,14 @@
-//! HTTP backend for the Windows GUI. A port of engine/gui/app.py: it serves the
-//! same JSON API, so the web UI in app/ui runs unchanged.
+//! HTTP backend for Frequency Recorder. The UI in app/ui talks only to this
+//! API; the app writes the engine config itself from the user's station
+//! (station.rs) and a supervisor (supervisor.rs) keeps the engine running.
 
 pub mod libconfig;
 pub mod live;
 pub mod process;
+pub mod recordings;
+pub mod station;
+pub mod supervisor;
+mod system;
 
 use axum::body::Body;
 use axum::extract::{Path as UrlPath, Query, Request, State};
@@ -14,99 +19,136 @@ use axum::{Json, Router};
 use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use station::{Station, LIVE_PORT_BASE};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tower::ServiceExt as _;
 use tower_http::services::{ServeDir, ServeFile};
 
-pub const LIVE_PORT_BASE: u16 = 17300;
 pub const LIVE_PORT_MAX: u16 = LIVE_PORT_BASE + 999;
-const DEFAULT_LIVE_SAMPLE_RATE: u32 = 16000; // engine's WAVE_RATE for an NFM build
-const AUDIO_EXTENSIONS: [&str; 3] = ["mp3", "wav", "ogg"];
+/// The engine's audio rate in an NFM build (WAVE_RATE).
+pub const LIVE_SAMPLE_RATE: u32 = 16000;
+/// The engine reports "starting" until it has run this long.
+const STARTING_FOR: Duration = Duration::from_secs(4);
 
 /// Where things live on disk. The desktop shell decides these per platform.
 #[derive(Clone, Debug)]
 pub struct Paths {
     pub ui_dir: PathBuf,
-    pub configs_dir: PathBuf,
-    pub state_path: PathBuf,
+    /// station.json, state.json and the generated engine.conf.
+    pub data_dir: PathBuf,
     pub default_recordings_dir: PathBuf,
-    pub default_binary: String,
+    pub engine_binary: String,
+    /// The app's own executable, for "Start with Windows". None where that makes no sense (dev server).
+    pub autostart_exe: Option<PathBuf>,
 }
 
 pub struct AppState {
     pub paths: Paths,
     pub process: process::ProcessManager,
     pub live: live::LiveAudioManager,
-    state_lock: std::sync::Mutex<()>,
+    pub supervisor: Mutex<supervisor::SupervisorState>,
+    station: Mutex<Station>,
+    recording_enabled: Mutex<bool>,
 }
 
 type Shared = Arc<AppState>;
 
-struct ApiError(StatusCode, String);
+struct ApiError(StatusCode, Value);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({"error": self.1}))).into_response()
+        (self.0, Json(self.1)).into_response()
     }
 }
 
 fn bad_request(msg: impl Into<String>) -> ApiError {
-    ApiError(StatusCode::BAD_REQUEST, msg.into())
+    ApiError(StatusCode::BAD_REQUEST, json!({"error": msg.into()}))
+}
+
+fn not_found() -> ApiError {
+    ApiError(StatusCode::NOT_FOUND, json!({"error": "Not found"}))
 }
 
 fn internal(e: impl std::fmt::Display) -> ApiError {
-    ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    ApiError(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()}))
 }
 
 type ApiResult = Result<Json<Value>, ApiError>;
 
+fn read_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
+    std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+fn write_json(path: &Path, value: &impl serde::Serialize) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(value).unwrap())?;
+    std::fs::rename(tmp, path)
+}
+
+#[derive(serde::Serialize, Deserialize)]
+#[serde(default)]
+struct Prefs {
+    recording_enabled: bool,
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Prefs { recording_enabled: true }
+    }
+}
+
 impl AppState {
     pub fn new(paths: Paths) -> Shared {
-        Arc::new(AppState { paths, process: process::ProcessManager::new(), live: live::LiveAudioManager::default(), state_lock: Default::default() })
+        let station: Station = read_json(&paths.data_dir.join("station.json"));
+        let prefs: Prefs = read_json(&paths.data_dir.join("state.json"));
+        Arc::new(AppState {
+            paths,
+            process: process::ProcessManager::new(),
+            live: live::LiveAudioManager::default(),
+            supervisor: Mutex::new(Default::default()),
+            station: Mutex::new(station),
+            recording_enabled: Mutex::new(prefs.recording_enabled),
+        })
     }
 
-    fn load_state(&self) -> serde_json::Map<String, Value> {
-        let mut state = std::fs::read_to_string(&self.paths.state_path)
-            .ok()
-            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-            .and_then(|v| v.as_object().cloned())
-            .unwrap_or_default();
-        state.entry("active_config").or_insert(json!("basic_multichannel.conf"));
-        state.entry("binary_path").or_insert(json!(self.paths.default_binary));
-        state.entry("recordings_dir").or_insert(json!(self.paths.default_recordings_dir.to_string_lossy()));
-        state.entry("live_sample_rate").or_insert(json!(DEFAULT_LIVE_SAMPLE_RATE));
-        state
+    pub fn station(&self) -> Station {
+        self.station.lock().unwrap().clone()
     }
 
-    fn save_state(&self, state: &serde_json::Map<String, Value>) -> Result<(), ApiError> {
-        if let Some(dir) = self.paths.state_path.parent() {
-            std::fs::create_dir_all(dir).map_err(internal)?;
+    pub fn recording_enabled(&self) -> bool {
+        *self.recording_enabled.lock().unwrap()
+    }
+
+    pub fn set_recording_enabled(&self, enabled: bool) -> std::io::Result<()> {
+        *self.recording_enabled.lock().unwrap() = enabled;
+        write_json(&self.paths.data_dir.join("state.json"), &Prefs { recording_enabled: enabled })
+    }
+
+    pub fn recordings_dir(&self) -> PathBuf {
+        let s = self.station.lock().unwrap();
+        if s.settings.recordings_dir.trim().is_empty() {
+            self.paths.default_recordings_dir.clone()
+        } else {
+            PathBuf::from(s.settings.recordings_dir.trim())
         }
-        std::fs::write(&self.paths.state_path, serde_json::to_string_pretty(state).unwrap()).map_err(internal)
     }
 
-    fn get_str(state: &serde_json::Map<String, Value>, key: &str) -> String {
-        state.get(key).and_then(Value::as_str).unwrap_or_default().to_string()
+    /// Makes sure the recordings folder exists, so it can be opened before anything is recorded.
+    pub fn ensure_recordings_dir(&self) -> std::io::Result<PathBuf> {
+        let dir = self.recordings_dir();
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
     }
 
-    fn config_path(&self, filename: &str) -> Result<PathBuf, ApiError> {
-        let valid = filename.ends_with(".conf") && filename.len() > 5 && filename.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-')) && !filename.contains("..");
-        if !valid {
-            return Err(bad_request("Invalid config filename"));
-        }
-        Ok(self.paths.configs_dir.join(filename))
-    }
-
-    fn active_config_path(&self) -> Result<(String, PathBuf), ApiError> {
-        let name = Self::get_str(&self.load_state(), "active_config");
-        let path = self.config_path(&name)?;
-        Ok((name, path))
-    }
-
-    fn recordings_dir(&self) -> PathBuf {
-        PathBuf::from(Self::get_str(&self.load_state(), "recordings_dir"))
+    /// Starts the background supervisor. Call once, inside a tokio runtime.
+    pub fn start_supervisor(self: &Arc<Self>) {
+        let _ = self.ensure_recordings_dir();
+        supervisor::spawn(self.clone());
     }
 }
 
@@ -118,103 +160,195 @@ fn safe_subpath(base: &Path, relpath: &str) -> Result<PathBuf, ApiError> {
             continue;
         }
         if part == ".." || part.contains(':') {
-            return Err(ApiError(StatusCode::FORBIDDEN, "Path escapes recordings directory".into()));
+            return Err(ApiError(StatusCode::FORBIDDEN, json!({"error": "Path escapes the recordings folder"})));
         }
         out.push(part);
     }
     Ok(out)
 }
 
-fn body_str(body: &Value, key: &str) -> String {
-    body.get(key).and_then(Value::as_str).unwrap_or_default().to_string()
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, ApiError> {
+    tokio::task::spawn_blocking(f).await.map_err(internal)
 }
 
-async fn list_configs(State(app): State<Shared>) -> ApiResult {
-    let mut files: Vec<String> = std::fs::read_dir(&app.paths.configs_dir)
-        .map_err(internal)?
-        .filter_map(|e| e.ok()?.file_name().into_string().ok())
-        .filter(|f| f.ends_with(".conf"))
-        .collect();
-    files.sort();
-    Ok(Json(json!({"files": files, "active": app.load_state().get("active_config")})))
-}
-
-async fn create_config(State(app): State<Shared>, Json(body): Json<Value>) -> ApiResult {
-    let mut filename = body_str(&body, "filename");
-    if !filename.ends_with(".conf") {
-        filename.push_str(".conf");
-    }
-    let path = app.config_path(&filename)?;
-    if path.exists() {
-        return Err(ApiError(StatusCode::CONFLICT, "A config with that name already exists".into()));
-    }
-    std::fs::write(&path, "devices:\n(\n);\n").map_err(internal)?;
-    Ok(Json(json!({"ok": true, "filename": filename})))
-}
-
-async fn select_config(State(app): State<Shared>, Json(body): Json<Value>) -> ApiResult {
-    let filename = body_str(&body, "filename");
-    app.config_path(&filename)?;
-    let _guard = app.state_lock.lock().unwrap();
-    let mut state = app.load_state();
-    state.insert("active_config".into(), json!(filename));
-    app.save_state(&state)?;
-    Ok(Json(json!({"ok": true})))
-}
-
-async fn get_config(State(app): State<Shared>) -> ApiResult {
-    let (name, path) = app.active_config_path()?;
-    let text = std::fs::read_to_string(&path).map_err(|e| bad_request(format!("Cannot read {}: {e}", path.display())))?;
-    let (data, error) = match libconfig::parse(&text) {
-        Ok(tree) => (tree, Value::Null),
-        Err(e) => (Value::Null, json!(e.to_string())),
-    };
-    Ok(Json(json!({"filename": name, "data": data, "raw": text, "error": error})))
-}
-
-async fn save_config(State(app): State<Shared>, Json(body): Json<Value>) -> ApiResult {
-    let (_, path) = app.active_config_path()?;
-    let text = libconfig::dump(body.get("data").unwrap_or(&Value::Null)).map_err(|e| bad_request(format!("Could not serialize config: {e}")))?;
-    std::fs::write(&path, &text).map_err(internal)?;
-    Ok(Json(json!({"ok": true, "raw": text})))
-}
-
-async fn save_raw_config(State(app): State<Shared>, Json(body): Json<Value>) -> ApiResult {
-    let (_, path) = app.active_config_path()?;
-    let text = body_str(&body, "raw");
-    libconfig::parse(&text).map_err(|e| bad_request(format!("Syntax error: {e}")))?;
-    std::fs::write(&path, &text).map_err(internal)?;
-    Ok(Json(json!({"ok": true})))
-}
-
-async fn validate_raw_config(Json(body): Json<Value>) -> ApiResult {
-    Ok(Json(match libconfig::parse(&body_str(&body, "raw")) {
-        Ok(_) => json!({"ok": true}),
-        Err(e) => json!({"ok": false, "error": e.to_string()}),
-    }))
-}
-
-async fn get_settings(State(app): State<Shared>) -> ApiResult {
-    let state = app.load_state();
+async fn get_station(State(app): State<Shared>) -> ApiResult {
     Ok(Json(json!({
-        "binary_path": state["binary_path"],
-        "recordings_dir": state["recordings_dir"],
-        "live_sample_rate": state["live_sample_rate"],
-        "live_port_base": LIVE_PORT_BASE,
-        "live_port_max": LIVE_PORT_MAX,
+        "station": app.station(),
+        "ctcss_tones": station::CTCSS_TONES.to_vec(),
+        "default_recordings_dir": app.paths.default_recordings_dir,
+        "autostart_available": app.paths.autostart_exe.is_some(),
     })))
 }
 
-async fn update_settings(State(app): State<Shared>, Json(body): Json<Value>) -> ApiResult {
-    let _guard = app.state_lock.lock().unwrap();
-    let mut state = app.load_state();
-    for key in ["binary_path", "recordings_dir", "live_sample_rate"] {
-        if let Some(v) = body.get(key) {
-            state.insert(key.into(), v.clone());
+fn fill_ids(s: &mut Station) {
+    let stamp = supervisor::now_unix() as u64;
+    for (i, f) in s.frequencies.iter_mut().enumerate().filter(|(_, f)| f.id.is_empty()) {
+        f.id = format!("f{stamp}{i}");
+    }
+    for (i, n) in s.nets.iter_mut().enumerate().filter(|(_, n)| n.id.is_empty()) {
+        n.id = format!("n{stamp}{i}");
+    }
+}
+
+async fn put_station(State(app): State<Shared>, Json(mut new): Json<Station>) -> ApiResult {
+    fill_ids(&mut new);
+    let errors = new.validate();
+    if !errors.is_empty() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, json!({"error": errors[0], "errors": errors})));
+    }
+    let old = app.station();
+    if new.settings.autostart != old.settings.autostart {
+        let exe = app.paths.autostart_exe.clone().ok_or_else(|| bad_request("Starting with Windows only works in the installed app."))?;
+        let enabled = new.settings.autostart;
+        blocking(move || system::set_autostart(&exe, enabled)).await?.map_err(bad_request)?;
+    }
+    write_json(&app.paths.data_dir.join("station.json"), &new).map_err(internal)?;
+    *app.station.lock().unwrap() = new.clone();
+    let _ = app.ensure_recordings_dir();
+    Ok(Json(json!({"station": new})))
+}
+
+#[derive(Deserialize)]
+struct PlanBody {
+    mhz: Vec<f64>,
+}
+
+async fn post_plan(Json(body): Json<PlanBody>) -> ApiResult {
+    Ok(Json(json!({"plan": station::plan(&body.mhz)})))
+}
+
+async fn get_status(State(app): State<Shared>) -> ApiResult {
+    let s = app.station();
+    let sup = app.supervisor.lock().unwrap().clone();
+    let enabled = app.recording_enabled();
+    let running = app.process.status().running;
+    let now = supervisor::now_unix();
+
+    let state = if !enabled {
+        "off"
+    } else if s.frequencies.is_empty() {
+        "setup"
+    } else if running && sup.engine_started.is_some_and(|t| t.elapsed() >= STARTING_FOR) {
+        "recording"
+    } else if running {
+        "starting"
+    } else {
+        "waiting"
+    };
+
+    let active_nets: Vec<&station::Net> = s.nets.iter().filter(|n| sup.active_nets.contains(&n.id)).collect();
+    let frequencies: Vec<Value> = s
+        .frequencies
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let port = LIVE_PORT_BASE + i as u16;
+            let a = app.live.get(port).activity();
+            let net = active_nets.iter().find(|n| (n.mhz - f.mhz).abs() < 0.0005).map(|n| n.name.clone());
+            json!({"id": f.id, "mhz": f.mhz, "name": f.name, "port": port, "on_air": a.on_air && running, "level_dbfs": a.level_dbfs, "last_heard_unix": a.last_heard_unix, "net": net})
+        })
+        .collect();
+
+    let mut warnings = Vec::new();
+    let hours = s.settings.silence_warning_hours;
+    if state == "recording" && hours > 0 {
+        let reference = sup.last_heard_any.unwrap_or(0.0).max(sup.watching_since_unix.unwrap_or(now));
+        if now - reference > hours as f64 * 3600.0 {
+            warnings.push(format!("Nothing has been heard on any frequency for over {hours} hours. Check the antenna and the dongle."));
         }
     }
-    app.save_state(&state)?;
+    let dir = app.recordings_dir();
+    let mhz: Vec<f64> = s.frequencies.iter().map(|f| f.mhz).collect();
+    Ok(Json(json!({
+        "recording_enabled": enabled,
+        "state": state,
+        "problem": sup.problem,
+        "started_unix": if running { sup.engine_started_unix } else { None },
+        "restarts": sup.restarts,
+        "plan": station::plan(&mhz),
+        "frequencies": frequencies,
+        "active_nets": active_nets.iter().map(|n| &n.name).collect::<Vec<_>>(),
+        "warnings": warnings,
+        "recordings_dir": dir,
+        "recordings_dir_exists": dir.is_dir(),
+        "disk": {"used_bytes": sup.disk_used, "free_bytes": system::free_space(&dir)},
+        "live_sample_rate": LIVE_SAMPLE_RATE,
+    })))
+}
+
+#[derive(Deserialize)]
+struct RecordingBody {
+    enabled: bool,
+}
+
+async fn post_recording(State(app): State<Shared>, Json(body): Json<RecordingBody>) -> ApiResult {
+    app.set_recording_enabled(body.enabled).map_err(internal)?;
     Ok(Json(json!({"ok": true})))
+}
+
+#[derive(Deserialize)]
+struct RecordingsQuery {
+    /// Unix time range, inclusive start.
+    from: Option<f64>,
+    to: Option<f64>,
+    limit: Option<usize>,
+}
+
+async fn list_recordings(State(app): State<Shared>, Query(q): Query<RecordingsQuery>) -> ApiResult {
+    let base = app.recordings_dir();
+    let b = base.clone();
+    let mut recs = blocking(move || recordings::scan(&b)).await?;
+    recs.retain(|r| q.from.map_or(true, |f| r.start_unix >= f) && q.to.map_or(true, |t| r.start_unix < t));
+    if let Some(limit) = q.limit {
+        recs.truncate(limit);
+    }
+    Ok(Json(json!({"base_dir": base, "recordings": recs})))
+}
+
+async fn delete_recording(State(app): State<Shared>, UrlPath(relpath): UrlPath<String>) -> ApiResult {
+    let full = safe_subpath(&app.recordings_dir(), &relpath)?;
+    if !full.is_file() || full.extension().and_then(|e| e.to_str()) != Some("mp3") {
+        return Err(not_found());
+    }
+    std::fs::remove_file(&full).map_err(internal)?;
+    let _ = std::fs::remove_file(recordings::segment_log_for(&full));
+    Ok(Json(json!({"ok": true})))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RevealBody {
+    path: Option<String>,
+}
+
+async fn reveal(State(app): State<Shared>, body: Option<Json<RevealBody>>) -> ApiResult {
+    let base = app.ensure_recordings_dir().map_err(internal)?;
+    let target = match body.and_then(|b| b.0.path) {
+        Some(rel) => {
+            let full = safe_subpath(&base, &rel)?;
+            if !full.exists() {
+                return Err(not_found());
+            }
+            Some(full)
+        }
+        None => None,
+    };
+    system::reveal(&base, target.as_deref()).map_err(internal)?;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn pick_folder(State(app): State<Shared>) -> ApiResult {
+    let start = app.recordings_dir();
+    let picked = blocking(move || system::pick_folder(&start)).await?.map_err(bad_request)?;
+    Ok(Json(json!({"path": picked})))
+}
+
+async fn serve_audio(State(app): State<Shared>, UrlPath(relpath): UrlPath<String>, req: Request) -> Result<Response, ApiError> {
+    let full = safe_subpath(&app.recordings_dir(), &relpath)?;
+    if !full.is_file() {
+        return Err(not_found());
+    }
+    ServeFile::new(full).oneshot(req).await.map(|r| r.map(Body::new)).map_err(internal)
 }
 
 #[derive(Deserialize)]
@@ -235,147 +369,30 @@ async fn live_chunk(State(app): State<Shared>, UrlPath(port): UrlPath<u16>, Quer
     Ok(Json(json!({"chunk": base64::engine::general_purpose::STANDARD.encode(chunk), "next": next})))
 }
 
-fn walk_audio(base: &Path, dir: &Path, out: &mut Vec<Value>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(meta) = entry.metadata() else { continue };
-        if meta.is_dir() {
-            walk_audio(base, &path, out);
-            continue;
-        }
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
-        if !AUDIO_EXTENSIONS.contains(&ext.as_str()) {
-            continue;
-        }
-        let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs_f64()).unwrap_or(0.0);
-        let date = chrono::DateTime::from_timestamp(mtime as i64, 0)
-            .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
-            .unwrap_or_default();
-        let rel: Vec<String> = path.strip_prefix(base).unwrap_or(&path).components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
-        out.push(json!({
-            "path": rel.join("/"),
-            "name": entry.file_name().to_string_lossy(),
-            "bytes": meta.len(),
-            "mtime": mtime,
-            "date": date,
-        }));
-    }
-}
-
-async fn list_recordings(State(app): State<Shared>) -> ApiResult {
-    let base = app.recordings_dir();
-    let mut entries = Vec::new();
-    let b = base.clone();
-    let entries = tokio::task::spawn_blocking(move || {
-        walk_audio(&b, &b, &mut entries);
-        entries.sort_by(|a, b| b["mtime"].as_f64().partial_cmp(&a["mtime"].as_f64()).unwrap_or(std::cmp::Ordering::Equal));
-        entries
-    })
-    .await
-    .map_err(internal)?;
-    Ok(Json(json!({"base_dir": base.to_string_lossy(), "exists": base.is_dir(), "recordings": entries})))
-}
-
-fn folder_opener() -> Option<&'static str> {
-    if cfg!(windows) {
-        Some("explorer")
-    } else if cfg!(target_os = "macos") {
-        Some("open")
-    } else {
-        Some("xdg-open")
-    }
-}
-
-async fn open_recordings_folder(State(app): State<Shared>) -> ApiResult {
-    let base = app.recordings_dir();
-    if !base.is_dir() {
-        return Err(bad_request(format!("Folder does not exist yet: {}", base.display())));
-    }
-    let opener = folder_opener().ok_or_else(|| bad_request("No file manager opener found on this machine."))?;
-    std::process::Command::new(opener).arg(&base).spawn().map_err(internal)?;
-    Ok(Json(json!({"ok": true})))
-}
-
-async fn delete_recording(State(app): State<Shared>, UrlPath(relpath): UrlPath<String>) -> ApiResult {
-    let full = safe_subpath(&app.recordings_dir(), &relpath)?;
-    if !full.is_file() {
-        return Err(ApiError(StatusCode::NOT_FOUND, "Not found".into()));
-    }
-    std::fs::remove_file(&full).map_err(internal)?;
-    Ok(Json(json!({"ok": true})))
-}
-
-async fn serve_audio(State(app): State<Shared>, UrlPath(relpath): UrlPath<String>, req: Request) -> Result<Response, ApiError> {
-    let full = safe_subpath(&app.recordings_dir(), &relpath)?;
-    if !full.is_file() {
-        return Err(ApiError(StatusCode::NOT_FOUND, "Not found".into()));
-    }
-    ServeFile::new(full).oneshot(req).await.map(|r| r.map(Body::new)).map_err(internal)
-}
-
-async fn process_status(State(app): State<Shared>) -> ApiResult {
-    Ok(Json(serde_json::to_value(app.process.status()).unwrap()))
-}
-
-#[derive(Deserialize)]
-struct LogSince {
-    #[serde(default)]
-    since: usize,
-}
-
-async fn process_logs(State(app): State<Shared>, Query(q): Query<LogSince>) -> ApiResult {
-    let lines = app.process.logs(q.since);
-    let next = q.since + lines.len();
-    Ok(Json(json!({"lines": lines, "next": next})))
-}
-
-async fn run_blocking<F: FnOnce() -> Result<(), String> + Send + 'static>(f: F) -> ApiResult {
-    tokio::task::spawn_blocking(f).await.map_err(internal)?.map_err(bad_request)?;
-    Ok(Json(json!({"ok": true})))
-}
-
-async fn process_start(State(app): State<Shared>) -> ApiResult {
-    let (_, path) = app.active_config_path()?;
-    let binary = AppState::get_str(&app.load_state(), "binary_path");
-    run_blocking(move || app.process.start(&binary, &path)).await
-}
-
-async fn process_stop(State(app): State<Shared>) -> ApiResult {
-    run_blocking(move || {
-        app.process.stop(Duration::from_secs(5));
-        Ok(())
-    })
-    .await
-}
-
-async fn process_restart(State(app): State<Shared>) -> ApiResult {
-    let (_, path) = app.active_config_path()?;
-    let binary = AppState::get_str(&app.load_state(), "binary_path");
-    run_blocking(move || app.process.restart(&binary, &path)).await
+async fn engine_log(State(app): State<Shared>, Query(q): Query<Since>) -> ApiResult {
+    let since = q.since as usize;
+    let lines = app.process.logs(since);
+    let next = since + lines.len();
+    let config = std::fs::read_to_string(app.paths.data_dir.join("engine.conf")).unwrap_or_default();
+    Ok(Json(json!({"lines": lines, "next": next, "config": config, "binary": app.paths.engine_binary})))
 }
 
 pub fn router(app: Shared) -> Router {
-    let index = app.paths.ui_dir.join("templates").join("index.html");
+    let index = app.paths.ui_dir.join("index.html");
     Router::new()
         .route_service("/", ServeFile::new(index))
         .nest_service("/static", ServeDir::new(app.paths.ui_dir.join("static")))
-        .route("/api/configs", get(list_configs).post(create_config))
-        .route("/api/configs/select", post(select_config))
-        .route("/api/config", get(get_config).post(save_config))
-        .route("/api/config/raw", post(save_raw_config))
-        .route("/api/config/validate", post(validate_raw_config))
-        .route("/api/settings", get(get_settings).post(update_settings))
-        .route("/api/live/:port/chunk", get(live_chunk))
+        .route("/api/station", get(get_station).put(put_station))
+        .route("/api/plan", post(post_plan))
+        .route("/api/status", get(get_status))
+        .route("/api/recording", post(post_recording))
         .route("/api/recordings", get(list_recordings))
-        .route("/api/recordings/open", post(open_recordings_folder))
         .route("/api/recordings/*relpath", delete(delete_recording))
+        .route("/api/reveal", post(reveal))
+        .route("/api/pick-folder", post(pick_folder))
+        .route("/api/live/:port/chunk", get(live_chunk))
+        .route("/api/engine/log", get(engine_log))
         .route("/audio/*relpath", get(serve_audio))
-        .route("/api/process/status", get(process_status))
-        .route("/api/process/logs", get(process_logs))
-        .route("/api/process/start", post(process_start))
-        .route("/api/process/stop", post(process_stop))
-        .route("/api/process/restart", post(process_restart))
         .with_state(app)
 }
 

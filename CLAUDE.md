@@ -13,40 +13,51 @@ Guidance for Claude Code (and humans) working in this repo.
 A Windows desktop app for RTLSDR-Airband aimed at recording ham repeater nets.
 
 - `engine/`: git submodule of `ruchirguitar/RTLSDR-Airband`, tracking branch
-  `claude/determined-lamport-0pugtu` for now. Windows fixes to the C++ engine go
-  **in that repo**, behind `#ifdef _WIN32`, never here. Its Linux web GUI lives in
-  `engine/gui/` (Python/Flask) and is the reference implementation for this app.
-- `app/ui/`: copy of that web UI (`static/`, `templates/`).
-- `app/configs/`: sample engine configs.
-- `app/backend/`: Rust library (axum) that serves the same JSON API as the Flask
-  app, plus the libconfig reader/writer (`libconfig.rs`), engine process manager
-  (`process.rs`) and live-audio UDP listener (`live.rs`). Platform-neutral and
-  fully testable on Linux: `cd app && cargo test -p airband-backend`.
-- `app/src-tauri/`: thin Tauri 2 shell. Starts the backend on 127.0.0.1:5050
-  (falls back to a free port), opens a window on it, and stops the engine on exit.
-  Bundles `app/ui`, `app/configs` and `src-tauri/engine-bin/` (the engine exe +
-  DLLs, filled in by CI or by hand, not committed).
+  `claude/determined-lamport-0pugtu` for now. Engine changes go **in that repo**
+  (Windows-only ones behind `#ifdef _WIN32`), never here. Its Linux web GUI in
+  `engine/gui/` (Python/Flask) is the older design this app started from; the
+  Windows app no longer mirrors it.
+- `app/ui/`: the app's UI (`index.html`, `static/app.js`, `static/style.css`),
+  vanilla JS, no build step. Screens: Monitor, Recordings, Nets, frequency
+  editor, Settings (hash routes). Design mock-ups live in a Claude Design canvas.
+- `app/backend/`: Rust library (axum) with the app's JSON API and logic.
+  Platform-neutral and testable on Linux: `cd app && cargo test -p airband-backend`.
+  - `station.rs`: the user's setup (receiver, frequencies, nets, recording
+    options, settings) saved as `station.json`, its validation, the receiver
+    centre (`plan`) and the engine config generated from it (`engine_config`).
+    Users never see engine config files.
+  - `supervisor.rs`: every 2 s, makes the engine match the station: starts it,
+    restarts it when the generated config changes (station edit, a net starting
+    or ending), restarts after a crash or dongle replug with 5-60 s backoff,
+    applies retention hourly. Nets run over their end time while the frequency
+    is still busy (up to `net_overrun_max_min`).
+  - `recordings.rs`: scans the recordings folder and reads each mp3's
+    `.segments.tsv`; retention deletes old clips but never `Nets/`.
+  - `live.rs`: UDP listeners for the engine's live audio (port 17300 + index);
+    a packet in the last 0.6 s means the frequency is on air.
+  - `process.rs`, `libconfig.rs` (parser, used to check generated configs;
+    tests round-trip `engine/config/*.conf`), `system.rs` (disk space,
+    Explorer, folder picker via `rfd`, start with Windows via `auto-launch`).
+- `app/src-tauri/`: Tauri 2 shell. Starts the backend on 127.0.0.1:5050 (or a
+  free port) and the supervisor, opens a window on it, adds a tray icon
+  (Open / Start-Stop recording / Quit), hides to the tray on close when
+  `close_to_tray` is set, starts hidden with `--hidden` (used by autostart), and
+  allows one instance only. Bundles `app/ui` and `src-tauri/engine-bin/` (the
+  engine exe + DLLs, filled in by CI or by hand, not committed).
 - `.github/workflows/windows.yml`: builds the engine with MSYS2, runs backend
   tests and produces the NSIS/MSI installers as artifacts.
 
-## App architecture plan
+## How recording works
 
-`app/ui/static/app.js` works unchanged because the Rust backend serves the same
-HTTP API the Flask app does (an axum server on 127.0.0.1, which the Tauri window
-loads). Keep `app/ui` in sync with `engine/gui/` when the UI changes. The endpoints to port are the `@app.*` routes in `engine/gui/app.py`:
-configs (list/create/select/get/save/raw/validate), settings, live audio chunks,
-recordings (list/open folder/delete/serve audio), process (status/logs/start/stop/restart).
-
-Windows differences from the Python version:
-- The engine runs hidden (`CREATE_NO_WINDOW`) with stdin piped. Closing that
-  pipe is the stop request (the engine watches piped stdin on Windows and exits
-  cleanly, finishing open recordings); it is killed only after a 5 s timeout.
-  This also stops an orphaned engine if the app crashes.
-- Open folders with `explorer.exe`.
-- Default paths go under the user's Documents / AppData, not `~/`.
-- libconfig parsing is our own `libconfig.rs` (no maintained crate exists). It
-  must keep the scalar wrapping and write lowercase bools and floats with a
-  decimal point; its tests round-trip every file in `app/configs/`.
+Every frequency gets a `file` output with `split_on_transmission`, gap tones,
+normalization and a segment log (engine features), plus a `udp_stream` for live
+audio. Outside nets: `<recordings>/<freq>/YYYY/MM/DD/<freq>_<time>.mp3`, overs
+less than `clip_join_sec` apart joined. While a net is active its frequency
+writes `<recordings>/Nets/<net name>/...` with `net_join_sec`. Switching costs
+an engine restart (~2 s). The engine runs hidden with stdin piped; closing the
+pipe makes it finish its recordings and exit (killed after 5 s). Data lives in
+`%APPDATA%\org.frequencyrecorder.app` (`station.json`, `state.json` for the
+on/off switch, generated `engine.conf`).
 
 ## Engine build
 
@@ -78,16 +89,16 @@ for the GPL).
 - Net recording is in the engine: `split_gap_tone`, `split_normalize`,
   `split_normalize_target`, `split_segment_log` on split_on_transmission file
   outputs (see `engine/src/CLAUDE.md`, `engine/config/split_join_net.conf`).
-  Not in the app UI yet.
-- Not yet checked from the app: Start/Stop from Process Control, live
-  listening speed, closing the app leaves no `rtl_airband.exe` running.
-- Planned UI redesign (dashboard with waterfall, Recordings, Nets with
-  editable schedules, Settings): mock-ups in a Claude Design canvas. App-side
-  backlog: recordings folder created on start and always used by new
-  frequencies, scheduled nets (restart the engine with the net's settings at
-  window edges), start with Windows + tray, retention, local-time names
-  (`localtime = true`), 24 h silence warning, auto-restart on engine exit or
-  dongle replug, CTCSS option. The waterfall needs a new engine output.
-- To debug the app locally, run the backend without Tauri:
-  `cd app && cargo run -p airband-backend --example dev_server`, then open
-  http://127.0.0.1:5050. Point the binary path setting at the built engine.
+- UI rebuilt 2026-11-12 (station model, supervisor, nets, tray, retention,
+  autostart, silence warning, CTCSS, per-tile squelch). Checked through the dev
+  server with the dongle: adding a frequency starts the engine, squelch changes
+  reach the engine, Recordings lists and plays clips and nets with over marks.
+  Not yet checked by hand: tray menu and close-to-tray, start with Windows,
+  single instance, live listening speed, a scheduled net switching over, a real
+  dongle unplug/replug.
+- Next: the waterfall needs a new engine output (spectrum over UDP); the band
+  view on Monitor is a placeholder with frequency markers until then.
+- To debug the app locally without Tauri:
+  `cd app && cargo run -p airband-backend --example dev_server [engine exe]`
+  (defaults to `src-tauri/engine-bin/rtl_airband.exe`, data in
+  `%TEMP%\frequency-recorder-dev`), then open http://127.0.0.1:5050.
