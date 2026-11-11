@@ -28,6 +28,14 @@ cmake --build build
 ./build/src/rtl_airband.exe -v
 ```
 
+Unit tests (downloads GoogleTest on the first run; `builds/` is git-ignored):
+
+```bash
+cmake -G Ninja -B builds/windows-tests -DCMAKE_BUILD_TYPE=Debug -DNFM=TRUE -DPLATFORM=generic -DPULSEAUDIO=OFF -DBUILD_UNITTESTS=TRUE
+cmake --build builds/windows-tests
+./builds/windows-tests/src/unittests.exe
+```
+
 ## 3. USB driver for the dongle (once per PC)
 
 Windows doesn't let programs talk to an RTL-SDR until it uses the WinUSB driver.

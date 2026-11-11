@@ -63,17 +63,31 @@ recording aviation traffic is illegal in some countries and the app is meant for
 ham nets and similar. Crediting the engine as RTLSDR-Airband is fine (and needed
 for the GPL).
 
-## Status (hand-off from the cloud session)
+## Status
 
-- Engine builds on Windows (MSYS2/UCRT64) and passes its unit tests; Windows
-  changes are on branch `claude/determined-lamport-0pugtu` of the engine fork.
-- This repo's `windows.yml` builds a working installer; backend tests pass.
-- **Not yet tested on real hardware.** First things to check on a Windows PC
-  with an RTL-SDR (after Zadig/WinUSB): engine starts from the app (Process
-  Control log), a transmission produces a file in Recordings, live listening
-  plays at the right speed, Stop leaves a complete MP3, closing the app leaves
-  no `rtl_airband.exe` running. Unconfirmed: whether the engine creates the
-  per-frequency recordings folder itself.
+- Engine builds on Windows (MSYS2/UCRT64) and its unit tests run and pass
+  there (they did not before 2026-11-12: a missing `fft_size` and `/tmp`).
+  Windows changes are on branch `claude/determined-lamport-0pugtu` of the
+  engine fork.
+- Tested on real hardware (RTL-SDR Blog V4, 2026-11-12): the engine opens the
+  dongle, records and stops cleanly on stdin close. It creates the output
+  `directory` itself (one level only: the parent must exist).
+- Fixed 2026-11-12: the engine opened mp3 files in text mode, so every
+  recording made on Windows before then is corrupt (decodes to a fraction of
+  its length).
+- Net recording is in the engine: `split_gap_tone`, `split_normalize`,
+  `split_normalize_target`, `split_segment_log` on split_on_transmission file
+  outputs (see `engine/src/CLAUDE.md`, `engine/config/split_join_net.conf`).
+  Not in the app UI yet.
+- Not yet checked from the app: Start/Stop from Process Control, live
+  listening speed, closing the app leaves no `rtl_airband.exe` running.
+- Planned UI redesign (dashboard with waterfall, Recordings, Nets with
+  editable schedules, Settings): mock-ups in a Claude Design canvas. App-side
+  backlog: recordings folder created on start and always used by new
+  frequencies, scheduled nets (restart the engine with the net's settings at
+  window edges), start with Windows + tray, retention, local-time names
+  (`localtime = true`), 24 h silence warning, auto-restart on engine exit or
+  dongle replug, CTCSS option. The waterfall needs a new engine output.
 - To debug the app locally, run the backend without Tauri:
   `cd app && cargo run -p airband-backend --example dev_server`, then open
   http://127.0.0.1:5050. Point the binary path setting at the built engine.
