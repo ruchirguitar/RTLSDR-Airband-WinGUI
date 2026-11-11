@@ -11,6 +11,8 @@ pub const WINDOW_HALF_MHZ: f64 = 1.28;
 pub const GOOD_HALF_MHZ: f64 = 1.0;
 pub const USABLE_HALF_MHZ: f64 = 1.2;
 pub const LIVE_PORT_BASE: u16 = 17300;
+pub const SPECTRUM_PORT: u16 = 17299;
+pub const SPECTRUM_LINES_PER_SEC: u32 = 15;
 pub const NETS_DIR: &str = "Nets";
 pub const CTCSS_TONES: [f64; 50] = [
     67.0, 69.3, 71.9, 74.4, 77.0, 79.7, 82.5, 85.4, 88.5, 91.5, 94.8, 97.4, 100.0, 103.5, 107.2, 110.9, 114.8, 118.8, 123.0, 127.3, 131.8, 136.5, 141.3, 146.2, 150.0, 151.4, 156.7, 159.8, 162.2,
@@ -284,8 +286,8 @@ impl Station {
             }
         }
         let o = &self.recording;
-        if !(1.0..=60.0).contains(&o.clip_join_sec) {
-            errors.push("Joining overs into one clip: 1 to 60 seconds.".into());
+        if !(0.0..=60.0).contains(&o.clip_join_sec) {
+            errors.push("Joining overs into one clip: 0 to 60 seconds.".into());
         }
         if !(5.0..=600.0).contains(&o.net_join_sec) {
             errors.push("Silence allowed during a net: 5 to 600 seconds.".into());
@@ -338,8 +340,10 @@ fn slash_path(p: &Path) -> String {
 }
 
 /// The engine config for `station`. `active_nets` are the nets recording right now:
-/// their frequency writes one joined file per net instead of clips.
-pub fn engine_config(station: &Station, recordings_dir: &Path, active_nets: &[&Net]) -> String {
+/// their frequency writes one joined file per net instead of clips. With
+/// `record` false nothing is saved, but the dongle keeps running for live
+/// listening and the waterfall.
+pub fn engine_config(station: &Station, recordings_dir: &Path, active_nets: &[&Net], record: bool) -> String {
     let s = station;
     let o = &s.recording;
     let mhz: Vec<f64> = s.frequencies.iter().map(|f| f.mhz).collect();
@@ -349,7 +353,9 @@ pub fn engine_config(station: &Station, recordings_dir: &Path, active_nets: &[&N
     c.push_str(&format!("localtime = {};\n", s.settings.local_time));
     c.push_str("devices:\n(\n  {\n    type = \"rtlsdr\";\n");
     c.push_str(&format!("    index = {};\n    gain = {};\n    correction = {};\n", s.receiver.device_index, fl(s.receiver.gain_db), s.receiver.correction_ppm));
-    c.push_str(&format!("    centerfreq = {};\n    channels:\n    (\n", fl(centre)));
+    c.push_str(&format!("    centerfreq = {};\n", fl(centre)));
+    c.push_str(&format!("    spectrum = {{ dest_address = \"127.0.0.1\"; dest_port = {SPECTRUM_PORT}; rate = {SPECTRUM_LINES_PER_SEC}; }};\n"));
+    c.push_str("    channels:\n    (\n");
     for (i, f) in s.frequencies.iter().enumerate() {
         let freq = fmt_mhz(f.mhz);
         c.push_str(&format!("      {{\n        freq = {};\n", fl(f.mhz)));
@@ -362,11 +368,12 @@ pub fn engine_config(station: &Station, recordings_dir: &Path, active_nets: &[&N
             c.push_str(&format!("        ctcss = {};\n", fl(tone)));
         }
         c.push_str("        outputs:\n        (\n");
-        if f.record {
+        if f.record && record {
             let net = active_nets.iter().find(|n| (n.mhz - f.mhz).abs() < 0.0005);
             let (dir, template, idle, max_time) = match net {
                 Some(n) => (recordings_dir.join(NETS_DIR).join(safe_name(&n.name)), safe_name(&n.name), o.net_join_sec, 4.0 * 3600.0),
-                None => (recordings_dir.join(&freq), freq.clone(), o.clip_join_sec, 3600.0),
+                // the engine needs an idle time above 0; half a second still splits every over
+                None => (recordings_dir.join(&freq), freq.clone(), o.clip_join_sec.max(0.5), 3600.0),
             };
             c.push_str("          {\n            type = \"file\";\n");
             c.push_str(&format!("            directory = {};\n            filename_template = {};\n", q(&slash_path(&dir)), q(&template)));
@@ -488,10 +495,11 @@ mod tests {
         let net = Net { name: "Morning net".into(), mhz: 145.4, ..Default::default() };
         let dir = Path::new("C:\\Users\\me\\Documents\\Frequency Recordings");
 
-        let clips = engine_config(&s, dir, &[]);
+        let clips = engine_config(&s, dir, &[], true);
         let tree = crate::libconfig::parse(&clips).expect("valid libconfig");
         let dev = &tree["devices"][0];
         assert_eq!(dev["centerfreq"]["value"], 145.3);
+        assert_eq!(dev["spectrum"]["dest_port"]["value"], 17299);
         assert_eq!(dev["gain"]["type"], "float");
         let ch0 = &dev["channels"][0];
         assert_eq!(ch0["label"]["value"], "Repeater \"A\"");
@@ -510,11 +518,17 @@ mod tests {
         assert_eq!(ch1["outputs"][0]["dest_port"]["value"], 17301);
         assert!(clips.contains("localtime = true;"));
 
-        let netted = engine_config(&s, dir, &[&net]);
+        let netted = engine_config(&s, dir, &[&net], true);
         let tree = crate::libconfig::parse(&netted).unwrap();
         let out = &tree["devices"][0]["channels"][0]["outputs"][0];
         assert_eq!(out["directory"]["value"], "C:/Users/me/Documents/Frequency Recordings/Nets/Morning net");
         assert_eq!(out["filename_template"]["value"], "Morning net");
         assert_eq!(out["split_max_idle_time"]["value"], 60.0);
+
+        let paused = engine_config(&s, dir, &[&net], false);
+        let tree = crate::libconfig::parse(&paused).unwrap();
+        let outs = tree["devices"][0]["channels"][0]["outputs"].as_array().unwrap();
+        assert_eq!(outs.len(), 1, "recording off: live audio only");
+        assert_eq!(outs[0]["type"]["value"], "udp_stream");
     }
 }

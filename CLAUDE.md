@@ -35,6 +35,7 @@ A Windows desktop app for RTLSDR-Airband aimed at recording ham repeater nets.
     `.segments.tsv`; retention deletes old clips but never `Nets/`.
   - `live.rs`: UDP listeners for the engine's live audio (port 17300 + index);
     a packet in the last 0.6 s means the frequency is on air.
+  - `spectrum.rs`: receives the engine's spectrum lines (port 17299) for the waterfall.
   - `process.rs`, `libconfig.rs` (parser, used to check generated configs;
     tests round-trip `engine/config/*.conf`), `system.rs` (disk space,
     Explorer, folder picker via `rfd`, start with Windows via `auto-launch`).
@@ -96,8 +97,14 @@ for the GPL).
   Not yet checked by hand: tray menu and close-to-tray, start with Windows,
   single instance, live listening speed, a scheduled net switching over, a real
   dongle unplug/replug.
-- Next: the waterfall needs a new engine output (spectrum over UDP); the band
-  view on Monitor is a placeholder with frequency markers until then.
+- Waterfall (2026-11-12): the engine's `spectrum` device output (512 bins,
+  15 lines/s, UDP 17299) -> `spectrum.rs` (last 600 lines) -> `/api/spectrum`
+  -> Monitor draws a trace and a waterfall, auto-levelled from the noise
+  floor, resizable by dragging its bottom edge (height kept in localStorage),
+  click to add or open a frequency. Checked on the dongle.
+- "Stop recording" only stops saving: the engine keeps running without file
+  outputs (state "monitoring"), so live listening and the waterfall go on.
+  Quitting the app releases the dongle.
 - To debug the app locally without Tauri:
   `cd app && cargo run -p airband-backend --example dev_server [engine exe]`
   (defaults to `src-tauri/engine-bin/rtl_airband.exe`, data in

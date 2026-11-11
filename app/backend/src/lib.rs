@@ -6,6 +6,7 @@ pub mod libconfig;
 pub mod live;
 pub mod process;
 pub mod recordings;
+pub mod spectrum;
 pub mod station;
 pub mod supervisor;
 mod system;
@@ -48,6 +49,7 @@ pub struct AppState {
     pub paths: Paths,
     pub process: process::ProcessManager,
     pub live: live::LiveAudioManager,
+    pub spectrum: spectrum::SpectrumFeed,
     pub supervisor: Mutex<supervisor::SupervisorState>,
     station: Mutex<Station>,
     recording_enabled: Mutex<bool>,
@@ -110,6 +112,7 @@ impl AppState {
             paths,
             process: process::ProcessManager::new(),
             live: live::LiveAudioManager::default(),
+            spectrum: Default::default(),
             supervisor: Mutex::new(Default::default()),
             station: Mutex::new(station),
             recording_enabled: Mutex::new(prefs.recording_enabled),
@@ -148,6 +151,7 @@ impl AppState {
     /// Starts the background supervisor. Call once, inside a tokio runtime.
     pub fn start_supervisor(self: &Arc<Self>) {
         let _ = self.ensure_recordings_dir();
+        self.spectrum.ensure_listening(station::SPECTRUM_PORT);
         supervisor::spawn(self.clone());
     }
 }
@@ -224,12 +228,14 @@ async fn get_status(State(app): State<Shared>) -> ApiResult {
     let running = app.process.status().running;
     let now = supervisor::now_unix();
 
-    let state = if !enabled {
-        "off"
-    } else if s.frequencies.is_empty() {
+    let state = if s.frequencies.is_empty() {
         "setup"
     } else if running && sup.engine_started.is_some_and(|t| t.elapsed() >= STARTING_FOR) {
-        "recording"
+        if enabled {
+            "recording"
+        } else {
+            "monitoring"
+        }
     } else if running {
         "starting"
     } else {
@@ -251,7 +257,7 @@ async fn get_status(State(app): State<Shared>) -> ApiResult {
 
     let mut warnings = Vec::new();
     let hours = s.settings.silence_warning_hours;
-    if state == "recording" && hours > 0 {
+    if (state == "recording" || state == "monitoring") && hours > 0 {
         let reference = sup.last_heard_any.unwrap_or(0.0).max(sup.watching_since_unix.unwrap_or(now));
         if now - reference > hours as f64 * 3600.0 {
             warnings.push(format!("Nothing has been heard on any frequency for over {hours} hours. Check the antenna and the dongle."));
@@ -369,6 +375,25 @@ async fn live_chunk(State(app): State<Shared>, UrlPath(port): UrlPath<u16>, Quer
     Ok(Json(json!({"chunk": base64::engine::general_purpose::STANDARD.encode(chunk), "next": next})))
 }
 
+/// New waterfall lines since `since`, as one base64 block of little-endian f32 dB values.
+async fn get_spectrum(State(app): State<Shared>, Query(q): Query<Since>) -> ApiResult {
+    if let Some(err) = app.spectrum.ensure_listening(station::SPECTRUM_PORT) {
+        return Err(bad_request(format!("Could not listen for the spectrum: {err}")));
+    }
+    let u = app.spectrum.since(q.since);
+    let last = u.lines.last();
+    let bytes: Vec<u8> = u.lines.iter().flat_map(|l| l.db.iter().flat_map(|v| v.to_le_bytes())).collect();
+    Ok(Json(json!({
+        "next": u.next,
+        "live": u.live,
+        "count": u.lines.len(),
+        "bins": last.map(|l| l.db.len()),
+        "centre_hz": last.map(|l| l.centre_hz),
+        "sample_rate": last.map(|l| l.sample_rate),
+        "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+    })))
+}
+
 async fn engine_log(State(app): State<Shared>, Query(q): Query<Since>) -> ApiResult {
     let since = q.since as usize;
     let lines = app.process.logs(since);
@@ -379,9 +404,11 @@ async fn engine_log(State(app): State<Shared>, Query(q): Query<Since>) -> ApiRes
 
 pub fn router(app: Shared) -> Router {
     let index = app.paths.ui_dir.join("index.html");
+    // the UI changes with app updates: always revalidate instead of running a cached copy
+    let no_cache = tower_http::set_header::SetResponseHeaderLayer::overriding(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-cache"));
+    let ui = Router::new().route_service("/", ServeFile::new(index)).nest_service("/static", ServeDir::new(app.paths.ui_dir.join("static"))).layer(no_cache);
     Router::new()
-        .route_service("/", ServeFile::new(index))
-        .nest_service("/static", ServeDir::new(app.paths.ui_dir.join("static")))
+        .merge(ui)
         .route("/api/station", get(get_station).put(put_station))
         .route("/api/plan", post(post_plan))
         .route("/api/status", get(get_status))
@@ -392,6 +419,7 @@ pub fn router(app: Shared) -> Router {
         .route("/api/pick-folder", post(pick_folder))
         .route("/api/live/:port/chunk", get(live_chunk))
         .route("/api/engine/log", get(engine_log))
+        .route("/api/spectrum", get(get_spectrum))
         .route("/audio/*relpath", get(serve_audio))
         .with_state(app)
 }

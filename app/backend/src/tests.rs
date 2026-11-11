@@ -127,7 +127,8 @@ async fn status_and_recording_switch() {
 
     call_json(&f.app, "POST", "/api/recording", Some(json!({"enabled": false}))).await;
     let (_, v) = call_json(&f.app, "GET", "/api/status", None).await;
-    assert_eq!(v["state"], "off");
+    assert_eq!(v["recording_enabled"], false);
+    assert_eq!(v["state"], "waiting", "the engine still runs (here: would run) with recording off");
     assert!(!AppState::new(f.app.paths.clone()).recording_enabled(), "persisted");
 }
 
@@ -142,7 +143,21 @@ async fn supervisor_reports_a_missing_engine() {
     assert!(v["problem"].as_str().unwrap().contains("Could not start"), "{v}");
     let conf = std::fs::read_to_string(f.dir.path().join("data/engine.conf")).unwrap();
     assert!(conf.contains("centerfreq = 145.3;"), "{conf}");
+    assert!(conf.contains("type = \"file\""), "{conf}");
     assert!(f.dir.path().join("rec/Nets").is_dir());
+}
+
+#[tokio::test]
+async fn recording_off_keeps_the_engine_for_listening() {
+    let f = fixture();
+    call_json(&f.app, "PUT", "/api/station", Some(two_repeaters())).await;
+    call_json(&f.app, "POST", "/api/recording", Some(json!({"enabled": false}))).await;
+    let app = f.app.clone();
+    tokio::task::spawn_blocking(move || supervisor::tick(&app, chrono::Local::now().naive_local())).await.unwrap();
+    let conf = std::fs::read_to_string(f.dir.path().join("data/engine.conf")).unwrap();
+    assert!(!conf.contains("type = \"file\""), "{conf}");
+    assert!(conf.contains("udp_stream"), "{conf}");
+    assert!(conf.contains("spectrum = {"), "{conf}");
 }
 
 #[tokio::test]

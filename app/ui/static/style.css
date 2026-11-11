@@ -138,15 +138,24 @@ input.invalid { border-color: var(--red); }
 .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 18px 20px; }
 .actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding-top: 14px; border-top: 1px solid var(--line); }
 
-/* band view */
-.band { position: relative; height: 92px; margin: 14px 16px 0; border-radius: var(--radius); background: var(--inset); border: 1px solid #1a2430; overflow: hidden; }
-.band .floor { position: absolute; inset: 0; background: repeating-linear-gradient(90deg, transparent 0 39px, #111a24 39px 40px); }
-.band .marker { position: absolute; top: 0; bottom: 0; width: 0; border-left: 1px dashed var(--cyan); transition: border-color 0.2s; }
-.band .marker .flag { position: absolute; top: 8px; left: 6px; white-space: nowrap; padding: 3px 8px; border-radius: 6px; background: var(--bg); border: 1px solid var(--cyan); font-family: var(--mono); font-size: 11px; color: var(--cyan-hi); }
-.band .marker .glow { position: absolute; bottom: 0; left: -14px; width: 28px; height: 0; background: var(--amber); opacity: 0.85; border-radius: 4px 4px 0 0; transition: height 0.2s; }
-.band .marker.on { border-color: var(--amber); }
-.band .marker.on .flag { border-color: var(--amber); color: var(--amber-hi); }
+/* waterfall */
+.wf { position: relative; display: flex; flex-direction: column; margin: 14px 16px 0; border: 1px solid #1a2430; border-bottom: 0; border-radius: var(--radius) var(--radius) 0 0; background: var(--inset); overflow: hidden; cursor: crosshair; }
+.wf-trace { display: block; width: 100%; height: 72px; flex: 0 0 72px; border-bottom: 1px solid #1a2430; }
+.wf-canvas { display: block; width: 100%; flex: 1; min-height: 0; image-rendering: pixelated; }
+.wf .marker { position: absolute; top: 0; bottom: 0; width: 0; border-left: 1px dashed rgba(61, 214, 245, 0.7); pointer-events: none; transition: border-color 0.2s; }
+.wf .marker .flag { position: absolute; top: 6px; left: 6px; white-space: nowrap; padding: 2px 7px; border-radius: 6px; background: rgba(11, 15, 20, 0.85); border: 1px solid var(--cyan); font-family: var(--mono); font-size: 11px; color: var(--cyan-hi); }
+.wf .marker.on { border-left: 2px solid var(--amber); }
+.wf .marker.on .flag { border-color: var(--amber); color: var(--amber-hi); }
+.wf-cursor { position: absolute; top: 0; bottom: 0; width: 1px; background: rgba(139, 232, 250, 0.6); pointer-events: none; }
+.wf-wait { position: absolute; inset: 72px 0 0 0; display: flex; align-items: center; justify-content: center; color: var(--muted); pointer-events: none; }
+.wf-resize { display: flex; align-items: center; justify-content: center; height: 14px; margin: 0 16px; border: 1px solid #1a2430; border-radius: 0 0 var(--radius) var(--radius); background: var(--panel-2); cursor: ns-resize; touch-action: none; }
+.wf-resize:hover, .wf-resize:focus-visible { background: #1d2a38; }
+.wf-resize span { width: 44px; height: 4px; border-radius: 2px; background: var(--line-2); }
 .band-scale { display: flex; justify-content: space-between; padding: 6px 16px 12px; font-family: var(--mono); font-size: 11px; color: var(--faint); }
+.squelch { display: flex; align-items: center; gap: 10px; }
+.squelch label { font-size: 12px; color: var(--text-2); }
+.squelch input { flex: 1; }
+.squelch b { width: 14px; text-align: center; }
 
 /* frequency tiles */
 .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }

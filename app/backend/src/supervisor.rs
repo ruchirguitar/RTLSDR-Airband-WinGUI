@@ -113,12 +113,11 @@ pub fn tick(app: &AppState, now_local: NaiveDateTime) {
     let previously = sup.active_nets.clone();
     sup.active_nets = nets_to_record(&station, now_local, now, &previously, &mut sup.net_overrun, last_heard);
     let active: Vec<&Net> = station.nets.iter().filter(|n| sup.active_nets.contains(&n.id)).collect();
-    let config = engine_config(&station, &rec_dir, &active);
+    // recording off still runs the dongle, for live listening and the waterfall
+    let config = engine_config(&station, &rec_dir, &active, enabled);
     let running = app.process.status().running;
 
-    let blocked = if !enabled {
-        Some(None)
-    } else if station.frequencies.is_empty() {
+    let blocked = if station.frequencies.is_empty() {
         Some(Some("Add a frequency to start recording.".to_string()))
     } else if let Some(e) = station.validate().first() {
         Some(Some(e.clone()))

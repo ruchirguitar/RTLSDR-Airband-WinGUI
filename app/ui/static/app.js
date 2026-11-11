@@ -134,12 +134,12 @@ function updateChrome() {
   if (!status) return;
   const pill = $("#status-pill"), text = $("#status-text"), btn = $("#btn-recording");
   const st = status.state;
-  pill.className = "pill " + ({ recording: "ok", starting: "warn", waiting: "bad" }[st] || "");
+  pill.className = "pill " + ({ recording: "ok", starting: "warn", waiting: "bad", monitoring: "warn" }[st] || "");
   text.textContent = {
     recording: `Recording · ${status.started_unix ? uptime(status.started_unix) : ""}`,
+    monitoring: "Listening only · not recording",
     starting: "Starting…",
-    waiting: "Not recording",
-    off: "Recording stopped",
+    waiting: "Receiver not running",
     setup: "Add a frequency to start",
   }[st] || st;
   btn.classList.toggle("hidden", st === "setup");
@@ -317,9 +317,17 @@ function viewMonitor(main) {
   }
   main.innerHTML = `<div class="page">
     <div id="banners">${bannerHtml()}</div>
-    <section class="panel" aria-label="Band">
-      <div class="panel-head"><h2>Band</h2><span class="muted">Everything the dongle hears. A full waterfall needs an engine update and comes later.</span></div>
-      <div class="band" id="band"><div class="floor"></div></div>
+    <section class="panel" aria-label="Waterfall">
+      <div class="panel-head"><h2>Waterfall</h2><span class="muted">Everything the dongle hears. Click to add a frequency; drag the bottom edge to resize.</span>
+        <span class="grow"></span><span class="mono" id="wf-readout" style="color:var(--cyan-hi)"></span></div>
+      <div class="wf" id="wf" style="height:${wfHeight()}px">
+        <canvas id="wf-trace" class="wf-trace" aria-hidden="true"></canvas>
+        <canvas id="wf-canvas" class="wf-canvas" role="img" aria-label="Waterfall of the receiver's band"></canvas>
+        <div id="wf-markers"></div>
+        <div class="wf-cursor hidden" id="wf-cursor"></div>
+        <div class="wf-wait" id="wf-wait">Waiting for the receiver…</div>
+      </div>
+      <div class="wf-resize" id="wf-resize" role="separator" aria-orientation="horizontal" aria-label="Resize the waterfall" tabindex="0"><span></span></div>
       <div class="band-scale" id="band-scale"></div>
     </section>
     <section class="tiles" aria-label="Frequencies">
@@ -332,9 +340,184 @@ function viewMonitor(main) {
     </section>
   </div>`;
   updateMonitorLive();
+  setupWaterfall();
   loadRecent(true).then(() => { if (route.name === "monitor") { fillMonitorRecordings(); } });
   fillMonitorRecordings();
 }
+
+// ---------- waterfall ----------
+
+const WF_MIN = 140, WF_MAX = 900, WF_DEFAULT = 300, WF_RANGE_DB = 45;
+const wf = { history: [], since: 0, meta: null, floor: null, timer: null, lut: null };
+
+function wfHeight() {
+  try { return Math.max(WF_MIN, Math.min(WF_MAX, Number(localStorage.getItem("wfHeight")) || WF_DEFAULT)); } catch { return WF_DEFAULT; }
+}
+
+function wfLut() {
+  if (wf.lut) return wf.lut;
+  const stops = [[0, 8, 12, 20], [0.35, 12, 46, 74], [0.6, 18, 150, 165], [0.82, 255, 176, 32], [1, 255, 246, 225]];
+  const lut = new Uint8ClampedArray(256 * 3);
+  for (let i = 0; i < 256; i++) {
+    const v = i / 255;
+    let k = 1;
+    while (k < stops.length - 1 && v > stops[k][0]) k++;
+    const a = stops[k - 1], b = stops[k], t = (v - a[0]) / (b[0] - a[0]);
+    for (let c = 0; c < 3; c++) lut[i * 3 + c] = a[c + 1] + (b[c + 1] - a[c + 1]) * Math.max(0, Math.min(1, t));
+  }
+  return (wf.lut = lut);
+}
+
+function wfRow(line, img, row) {
+  const lut = wfLut(), floor = wf.floor ?? -100;
+  const off = row * img.width * 4;
+  for (let x = 0; x < img.width; x++) {
+    const v = Math.max(0, Math.min(255, Math.round(((line[x] - floor) / WF_RANGE_DB) * 255)));
+    img.data[off + x * 4] = lut[v * 3];
+    img.data[off + x * 4 + 1] = lut[v * 3 + 1];
+    img.data[off + x * 4 + 2] = lut[v * 3 + 2];
+    img.data[off + x * 4 + 3] = 255;
+  }
+}
+
+function updateFloor(line) {
+  const sorted = Float32Array.from(line).sort();
+  const noise = sorted[Math.floor(sorted.length * 0.3)] - 3;
+  wf.floor = wf.floor == null ? noise : wf.floor * 0.95 + noise * 0.05;
+}
+
+function wfRedraw() {
+  const canvas = $("#wf-canvas");
+  if (!canvas || !wf.meta) return;
+  const h = canvas.clientHeight || 1;
+  canvas.width = wf.meta.bins;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  const img = ctx.createImageData(canvas.width, h);
+  for (let r = 0; r < h && r < wf.history.length; r++) wfRow(wf.history[wf.history.length - 1 - r], img, r);
+  ctx.putImageData(img, 0, 0);
+  wfTrace();
+  wfMarkers();
+}
+
+function wfAppend(lines) {
+  const canvas = $("#wf-canvas");
+  if (!canvas || !lines.length) return;
+  if (canvas.width !== wf.meta.bins || canvas.height !== canvas.clientHeight) return wfRedraw();
+  const ctx = canvas.getContext("2d");
+  const n = Math.min(lines.length, canvas.height);
+  ctx.drawImage(canvas, 0, 0, canvas.width, canvas.height - n, 0, n, canvas.width, canvas.height - n);
+  const img = ctx.createImageData(canvas.width, n);
+  for (let r = 0; r < n; r++) wfRow(lines[lines.length - 1 - r], img, r);
+  ctx.putImageData(img, 0, 0);
+  wfTrace();
+}
+
+function wfTrace() {
+  const c = $("#wf-trace");
+  const line = wf.history[wf.history.length - 1];
+  if (!c || !line) return;
+  const w = c.clientWidth, h = c.clientHeight, dpr = window.devicePixelRatio || 1;
+  c.width = w * dpr; c.height = h * dpr;
+  const ctx = c.getContext("2d");
+  ctx.scale(dpr, dpr);
+  const floor = wf.floor ?? -100;
+  const y = (v) => h - Math.max(0, Math.min(1, (v - floor + 5) / (WF_RANGE_DB + 10))) * (h - 4) - 2;
+  ctx.beginPath();
+  for (let i = 0; i < line.length; i++) {
+    const x = (i / (line.length - 1)) * w;
+    i ? ctx.lineTo(x, y(line[i])) : ctx.moveTo(x, y(line[i]));
+  }
+  ctx.strokeStyle = "#8be8fa";
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+  ctx.lineTo(w, h); ctx.lineTo(0, h); ctx.closePath();
+  ctx.fillStyle = "rgba(61,214,245,0.12)";
+  ctx.fill();
+}
+
+const wfLowHz = () => wf.meta.centre_hz - wf.meta.sample_rate / 2;
+const wfPct = (mhz) => ((mhz * 1e6 - wfLowHz()) / wf.meta.sample_rate) * 100;
+
+function wfMarkers() {
+  const box = $("#wf-markers");
+  if (!box || !wf.meta) return;
+  box.innerHTML = station.frequencies.map((f) => `<div class="marker" data-marker="${esc(f.id)}" style="left:${wfPct(f.mhz)}%"><div class="flag">${fmtMhz(f.mhz)}${f.name ? " " + esc(f.name) : ""}</div></div>`).join("");
+  const lo = wfLowHz() / 1e6, span = wf.meta.sample_rate / 1e6;
+  $("#band-scale").innerHTML = Array.from({ length: 6 }, (_, i) => `<span>${(lo + (i * span) / 5).toFixed(2)}</span>`).join("");
+  updateMonitorLive();
+}
+
+function wfFreqAt(clientX) {
+  const r = $("#wf").getBoundingClientRect();
+  return (wfLowHz() + ((clientX - r.left) / r.width) * wf.meta.sample_rate) / 1e6;
+}
+
+async function wfPoll() {
+  if (route.name !== "monitor" || !$("#wf")) return;
+  try {
+    const d = await api(`/api/spectrum?since=${wf.since}`);
+    $("#wf-wait").classList.toggle("hidden", d.live || wf.history.length > 0);
+    if (!d.count) return;
+    const raw = Uint8Array.from(atob(d.data), (c) => c.charCodeAt(0));
+    const all = new Float32Array(raw.buffer);
+    const meta = { bins: d.bins, centre_hz: d.centre_hz, sample_rate: d.sample_rate };
+    const retuned = !wf.meta || wf.meta.bins !== meta.bins || wf.meta.centre_hz !== meta.centre_hz;
+    if (retuned) wf.history = [];
+    wf.meta = meta;
+    wf.since = d.next;
+    const lines = [];
+    for (let i = 0; i < d.count; i++) lines.push(all.subarray(i * d.bins, (i + 1) * d.bins));
+    lines.forEach(updateFloor);
+    wf.history.push(...lines);
+    if (wf.history.length > WF_MAX) wf.history.splice(0, wf.history.length - WF_MAX);
+    retuned ? wfRedraw() : wfAppend(lines);
+  } catch { /* engine restarting */ }
+}
+
+function setupWaterfall() {
+  clearInterval(wf.timer);
+  wf.timer = setInterval(wfPoll, 150);
+  if (wf.meta) wfRedraw();
+  wfPoll();
+  const box = $("#wf"), cursor = $("#wf-cursor"), readout = $("#wf-readout");
+  box.addEventListener("mousemove", (e) => {
+    if (!wf.meta) return;
+    const r = box.getBoundingClientRect();
+    cursor.classList.remove("hidden");
+    cursor.style.left = `${e.clientX - r.left}px`;
+    readout.textContent = `${wfFreqAt(e.clientX).toFixed(4)} MHz`;
+  });
+  box.addEventListener("mouseleave", () => { cursor.classList.add("hidden"); readout.textContent = ""; });
+  box.addEventListener("click", (e) => {
+    if (!wf.meta) return;
+    const mhz = wfFreqAt(e.clientX);
+    const near = station.frequencies.find((f) => Math.abs(f.mhz - mhz) < 0.01);
+    if (near) { location.hash = `#/frequency/${encodeURIComponent(near.id)}`; return; }
+    location.hash = `#/frequency/new?mhz=${(Math.round(mhz / 0.0125) * 0.0125).toFixed(4)}`;
+  });
+  const handle = $("#wf-resize");
+  const setHeight = (h, save) => {
+    h = Math.max(WF_MIN, Math.min(WF_MAX, Math.round(h)));
+    box.style.height = `${h}px`;
+    wfRedraw();
+    if (save) try { localStorage.setItem("wfHeight", String(h)); } catch { /* private window */ }
+  };
+  handle.addEventListener("pointerdown", (e) => {
+    const startY = e.clientY, startH = box.clientHeight;
+    handle.setPointerCapture(e.pointerId);
+    const move = (ev) => setHeight(startH + ev.clientY - startY, false);
+    const up = (ev) => { handle.removeEventListener("pointermove", move); handle.removeEventListener("pointerup", up); setHeight(startH + ev.clientY - startY, true); };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", up);
+  });
+  handle.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowDown") { setHeight(box.clientHeight + 20, true); e.preventDefault(); }
+    if (e.key === "ArrowUp") { setHeight(box.clientHeight - 20, true); e.preventDefault(); }
+  });
+}
+
+window.addEventListener("resize", () => { if (route.name === "monitor") wfTrace(); });
 
 function tileHtml(f) {
   const mode = f.modulation === "am" ? "AM" : "FM";
@@ -347,12 +530,11 @@ function tileHtml(f) {
       <a class="btn ghost icon" href="#/frequency/${encodeURIComponent(f.id)}" aria-label="Edit ${esc(label(f))}">${ICON.edit}</a>
     </div>
     <div><span class="freq">${fmtMhz(f.mhz)}</span><span class="unit">MHz</span></div>
-    <div style="display:flex;align-items:center;gap:10px">
-      <div class="meter" aria-hidden="true" style="flex:1"><i data-meter></i></div>
-      <span class="label" style="white-space:nowrap">Squelch</span>
-      <button class="btn icon" type="button" data-act="squelch" data-id="${esc(f.id)}" data-delta="-1" aria-label="Lower squelch for ${esc(label(f))}">−</button>
-      <b class="mono" data-squelch="${esc(f.id)}" style="width:14px;text-align:center">${f.squelch}</b>
-      <button class="btn icon" type="button" data-act="squelch" data-id="${esc(f.id)}" data-delta="1" aria-label="Raise squelch for ${esc(label(f))}">+</button>
+    <div class="meter" aria-hidden="true"><i data-meter></i></div>
+    <div class="squelch">
+      <label for="sq-${esc(f.id)}">Squelch</label>
+      <input type="range" id="sq-${esc(f.id)}" min="1" max="9" step="1" value="${f.squelch}" data-squelch-id="${esc(f.id)}">
+      <b class="mono" data-squelch="${esc(f.id)}">${f.squelch}</b>
     </div>
     <div class="strip" data-strip aria-label="Activity in the last 24 hours"></div>
     <div class="strip-scale"><span>24 h ago</span><span>now</span></div>
@@ -366,19 +548,6 @@ function tileHtml(f) {
 
 function updateMonitorLive() {
   if (!status || !station) return;
-  const plan = status.plan;
-  const band = $("#band");
-  if (band && plan) {
-    const span = plan.high_mhz - plan.low_mhz;
-    const pos = (m) => ((m - plan.low_mhz) / span) * 100;
-    if (!band.dataset.ready || band.dataset.ready !== JSON.stringify(plan)) {
-      band.dataset.ready = JSON.stringify(plan);
-      band.innerHTML = `<div class="floor"></div>` + station.frequencies.map((f) =>
-        `<div class="marker" data-marker="${esc(f.id)}" style="left:${pos(f.mhz)}%"><div class="flag">${fmtMhz(f.mhz)} ${esc(f.name || "")}</div><div class="glow"></div></div>`).join("");
-      const step = span / 5;
-      $("#band-scale").innerHTML = Array.from({ length: 6 }, (_, i) => `<span>${(plan.low_mhz + i * step).toFixed(2)}</span>`).join("");
-    }
-  }
   for (const fs of status.frequencies) {
     const tile = $(`[data-tile="${CSS.escape(fs.id)}"]`);
     if (!tile) continue;
@@ -391,10 +560,7 @@ function updateMonitorLive() {
     netTag.classList.toggle("hidden", !fs.net);
     netTag.textContent = fs.net ? fs.net : "";
     const marker = $(`[data-marker="${CSS.escape(fs.id)}"]`);
-    if (marker) {
-      marker.classList.toggle("on", fs.on_air);
-      $(".glow", marker).style.height = `${level * 0.7}%`;
-    }
+    if (marker) marker.classList.toggle("on", fs.on_air);
     const btn = $(`[data-act="listen"][data-id="${CSS.escape(fs.id)}"]`);
     if (btn) {
       const on = live && live.port === fs.port;
@@ -760,9 +926,9 @@ function viewSettings(main) {
 
     <section class="panel" aria-label="Everyday recordings"><div class="panel-head"><h2>Everyday recordings</h2></div><div class="panel-body">
       <div class="form-grid">
-        <div class="field"><label for="s-join">Put overs in the same recording when they're less than</label>
-          <select id="s-join" data-recording="clip_join_sec" data-num>${opt([3, 5, 10, 20, 30, 60], o.clip_join_sec, (v) => `${v} seconds apart`)}</select>
-          <span class="hint">So a short back-and-forth is one recording instead of many.</span></div>
+        <div class="field"><label for="s-join">Put overs in the same recording when they're less than <b class="mono" id="s-join-text">${o.clip_join_sec} s</b> apart</label>
+          <input type="range" id="s-join" min="0" max="60" step="1" value="${o.clip_join_sec}" data-recording="clip_join_sec" data-num>
+          <span class="hint">0: every over is its own recording. Higher: a back-and-forth becomes one recording.</span></div>
         <div class="field"><label for="s-min">Ignore transmissions shorter than</label>
           <select id="s-min" data-recording="min_clip_sec" data-num>${opt([0, 0.5, 1, 2], o.min_clip_sec, (v) => (v ? `${v} s` : "Keep everything"))}</select>
           <span class="hint">Drops kerchunks and squelch blips.</span></div>
@@ -793,6 +959,7 @@ function viewSettings(main) {
   </div>`;
   $("#folder-state").textContent = status ? `${status.recordings_dir_exists ? "Folder ready" : "Folder will be created"} · recordings use ${bytes(status.disk.used_bytes)}${status.disk.free_bytes != null ? " · " + bytes(status.disk.free_bytes) + " free on this drive" : ""}` : "";
   $("#r-gain").addEventListener("input", (e) => { $("#r-gain-text").textContent = e.target.value; });
+  $("#s-join").addEventListener("input", (e) => { $("#s-join-text").textContent = `${e.target.value} s`; });
   $("#engine-details").addEventListener("toggle", async (e) => {
     if (!e.target.open) return;
     try {
@@ -812,15 +979,19 @@ function switchRow(key, title, sub, on, disabled = false) {
 
 let squelchTimer = null;
 
+// tile squelch sliders: the number follows the slider, the station is saved once it stops moving
+document.addEventListener("input", (e) => {
+  const id = e.target.dataset.squelchId;
+  if (!id) return;
+  const f = station.frequencies.find((x) => x.id === id);
+  if (!f) return;
+  f.squelch = Number(e.target.value);
+  $(`[data-squelch="${CSS.escape(id)}"]`).textContent = f.squelch;
+  clearTimeout(squelchTimer);
+  squelchTimer = setTimeout(() => saveStation(clone(station), `Squelch ${f.squelch} on ${label(f)}`), 900);
+});
+
 const actions = {
-  squelch(el) {
-    const f = station.frequencies.find((x) => x.id === el.dataset.id);
-    if (!f) return;
-    f.squelch = Math.max(1, Math.min(9, f.squelch + Number(el.dataset.delta)));
-    $(`[data-squelch="${CSS.escape(f.id)}"]`).textContent = f.squelch;
-    clearTimeout(squelchTimer);
-    squelchTimer = setTimeout(() => saveStation(clone(station), `Squelch ${f.squelch} on ${label(f)}`), 1200);
-  },
   async listen(el) {
     const fs = status && status.frequencies.find((x) => x.id === el.dataset.id);
     if (!fs) return;
@@ -977,10 +1148,10 @@ document.addEventListener("change", async (e) => {
 $("#btn-recording").addEventListener("click", async () => {
   if (!status) return;
   const enable = !status.recording_enabled;
-  if (!enable && !confirm("Stop recording? Nothing is recorded until you start it again.")) return;
+  if (!enable && !confirm("Stop recording? The receiver keeps running, so you can still watch the waterfall and listen live, but nothing is saved until you start recording again.")) return;
   try {
     await api("/api/recording", { method: "POST", body: { enabled: enable } });
-    toast(enable ? "Recording starts in a few seconds" : "Recording stopped");
+    toast(enable ? "Recording starts in a few seconds" : "Recording stopped. Still listening.");
     pollStatus();
   } catch (err) { toast(err.message, true); }
 });
