@@ -62,3 +62,18 @@ window title, Start menu, default `Documents\Frequency Recordings` folder,
 recording aviation traffic is illegal in some countries and the app is meant for
 ham nets and similar. Crediting the engine as RTLSDR-Airband is fine (and needed
 for the GPL).
+
+## Status (hand-off from the cloud session)
+
+- Engine builds on Windows (MSYS2/UCRT64) and passes its unit tests; Windows
+  changes are on branch `claude/determined-lamport-0pugtu` of the engine fork.
+- This repo's `windows.yml` builds a working installer; backend tests pass.
+- **Not yet tested on real hardware.** First things to check on a Windows PC
+  with an RTL-SDR (after Zadig/WinUSB): engine starts from the app (Process
+  Control log), a transmission produces a file in Recordings, live listening
+  plays at the right speed, Stop leaves a complete MP3, closing the app leaves
+  no `rtl_airband.exe` running. Unconfirmed: whether the engine creates the
+  per-frequency recordings folder itself.
+- To debug the app locally, run the backend without Tauri:
+  `cd app && cargo run -p airband-backend --example dev_server`, then open
+  http://127.0.0.1:5050. Point the binary path setting at the built engine.
