@@ -47,7 +47,7 @@ fn main() {
                 ui_dir: resources.join("ui"),
                 configs_dir,
                 state_path: data.join("state.json"),
-                default_recordings_dir: documents.join("airband-recordings"),
+                default_recordings_dir: documents.join("Frequency Recordings"),
                 default_binary: engine_binary(&resources),
             });
             app.manage(state.clone());
@@ -63,7 +63,7 @@ fn main() {
 
             let url: tauri::Url = format!("http://127.0.0.1:{port}/").parse().unwrap();
             WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
-                .title("Airband Recorder")
+                .title("Frequency Recorder")
                 .inner_size(1200.0, 860.0)
                 .min_inner_size(720.0, 500.0)
                 .build()?;

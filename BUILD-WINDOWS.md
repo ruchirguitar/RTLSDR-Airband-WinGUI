@@ -64,6 +64,6 @@ Installers land in `app\target\release\bundle\nsis\` (`.exe`) and `...\bundle\ms
 
 | What | Where |
 |---|---|
-| Configs (seeded from the samples on first run) | `%APPDATA%\org.rtlairband.wingui\configs\` |
-| App settings | `%APPDATA%\org.rtlairband.wingui\state.json` |
-| Recordings (default) | `Documents\airband-recordings\` |
+| Configs (seeded from the samples on first run) | `%APPDATA%\org.frequencyrecorder.app\configs\` |
+| App settings | `%APPDATA%\org.frequencyrecorder.app\state.json` |
+| Recordings (default) | `Documents\Frequency Recordings\` |

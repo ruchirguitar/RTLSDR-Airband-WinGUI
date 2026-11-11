@@ -53,3 +53,12 @@ Windows differences from the Python version:
 See BUILD-WINDOWS.md. Must be built with `-DNFM=TRUE` (FM repeaters) and
 `-DPULSEAUDIO=OFF`. The engine sends live audio as 32-bit float mono UDP at
 16 kHz (NFM builds).
+
+## Naming
+
+The app is called **Frequency Recorder** in everything a user sees (installer,
+window title, Start menu, default `Documents\Frequency Recordings` folder,
+`%APPDATA%\org.frequencyrecorder.app`). Don't use "airband" in user-facing names:
+recording aviation traffic is illegal in some countries and the app is meant for
+ham nets and similar. Crediting the engine as RTLSDR-Airband is fine (and needed
+for the GPL).
