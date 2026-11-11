@@ -14,20 +14,52 @@ pub struct Line {
     pub centre_hz: u32,
     pub sample_rate: u32,
     pub db: Vec<f32>,
+    pub channels: Vec<ChannelLevel>,
 }
 
-/// "FRSP", u8 version 1, 3 zero bytes, u32 centre_hz, u32 sample_rate, u32 bins, f32 dB[bins], little-endian.
+/// A channel's squelch as the engine sees it, in the line's dB scale.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct ChannelLevel {
+    pub freq_hz: u32,
+    pub noise_db: f32,
+    pub threshold_db: f32,
+    pub signal_db: f32,
+    pub open: bool,
+}
+
+/// "FRSP", u8 version, 3 zero bytes, u32 centre_hz, u32 sample_rate, u32 bins, f32 dB[bins], little-endian.
+/// Version 2 adds u32 channel count and per channel u32 freq_hz, f32 noise_db, threshold_db, signal_db, u8 open, 3 zero bytes.
 pub fn parse_packet(p: &[u8]) -> Option<Line> {
-    if p.len() < 20 || &p[0..4] != b"FRSP" || p[4] != 1 {
+    if p.len() < 20 || &p[0..4] != b"FRSP" || !(1..=2).contains(&p[4]) {
         return None;
     }
     let u32_at = |i: usize| u32::from_le_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]);
+    let f32_at = |i: usize| f32::from_le_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]);
     let bins = u32_at(16) as usize;
-    if bins == 0 || bins > 65536 || p.len() != 20 + bins * 4 {
+    let line_end = 20 + bins * 4;
+    if bins == 0 || bins > 65536 || p.len() < line_end {
         return None;
     }
-    let db = p[20..].chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
-    Some(Line { centre_hz: u32_at(8), sample_rate: u32_at(12), db })
+    let db = (0..bins).map(|i| f32_at(20 + i * 4)).collect();
+    let mut channels = Vec::new();
+    if p[4] == 1 {
+        if p.len() != line_end {
+            return None;
+        }
+    } else {
+        if p.len() < line_end + 4 {
+            return None;
+        }
+        let count = u32_at(line_end) as usize;
+        if p.len() != line_end + 4 + count * 20 {
+            return None;
+        }
+        for i in 0..count {
+            let c = line_end + 4 + i * 20;
+            channels.push(ChannelLevel { freq_hz: u32_at(c), noise_db: f32_at(c + 4), threshold_db: f32_at(c + 8), signal_db: f32_at(c + 12), open: p[c + 16] != 0 });
+        }
+    }
+    Some(Line { centre_hz: u32_at(8), sample_rate: u32_at(12), db, channels })
 }
 
 #[derive(Default)]
@@ -129,9 +161,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_engine_packets_with_channel_levels() {
+        let mut p = packet(145_300_000, &[-50.0]);
+        p[4] = 2;
+        p.extend(1u32.to_le_bytes());
+        p.extend(145_400_000u32.to_le_bytes());
+        for v in [-90.0f32, -80.0, -60.0] {
+            p.extend(v.to_le_bytes());
+        }
+        p.extend([1, 0, 0, 0]);
+        let line = parse_packet(&p).unwrap();
+        assert_eq!(line.channels, vec![ChannelLevel { freq_hz: 145_400_000, noise_db: -90.0, threshold_db: -80.0, signal_db: -60.0, open: true }]);
+        p.pop();
+        assert!(parse_packet(&p).is_none());
+    }
+
+    #[test]
     fn parses_engine_packets() {
         let line = parse_packet(&packet(145_300_000, &[-50.0, -60.5])).unwrap();
-        assert_eq!(line, Line { centre_hz: 145_300_000, sample_rate: 2_560_000, db: vec![-50.0, -60.5] });
+        assert_eq!(line, Line { centre_hz: 145_300_000, sample_rate: 2_560_000, db: vec![-50.0, -60.5], channels: vec![] });
         assert!(parse_packet(b"nope").is_none());
         let mut short = packet(1, &[1.0, 2.0]);
         short.pop();
@@ -141,7 +189,7 @@ mod tests {
     #[test]
     fn keeps_recent_lines_and_resets_on_retune() {
         let feed = SpectrumFeed::default();
-        let line = |c: u32| Line { centre_hz: c, sample_rate: 1, db: vec![0.0; 4] };
+        let line = |c: u32| Line { centre_hz: c, sample_rate: 1, db: vec![0.0; 4], channels: vec![] };
         for _ in 0..(MAX_LINES + 10) {
             feed.push(line(1));
         }

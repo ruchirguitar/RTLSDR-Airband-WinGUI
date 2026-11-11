@@ -152,6 +152,13 @@ input.invalid { border-color: var(--red); }
 .wf-resize:hover, .wf-resize:focus-visible { background: #1d2a38; }
 .wf-resize span { width: 44px; height: 4px; border-radius: 2px; background: var(--line-2); }
 .band-scale { display: flex; justify-content: space-between; padding: 6px 16px 12px; font-family: var(--mono); font-size: 11px; color: var(--faint); }
+.swatch { width: 12px; height: 12px; flex: 0 0 12px; border-radius: 3px; background: var(--fc, var(--cyan)); }
+.tile .squelch input { accent-color: var(--fc, var(--amber)); }
+.wf .marker { border-left-color: var(--fc, var(--cyan)); }
+.wf .marker .flag { border-color: var(--fc, var(--cyan)); color: var(--text); }
+.gain { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-2); }
+.gain input { width: 160px; }
+.gain b { width: 64px; color: var(--text); font-weight: 500; }
 .squelch { display: flex; align-items: center; gap: 10px; }
 .squelch label { font-size: 12px; color: var(--text-2); }
 .squelch input { flex: 1; }

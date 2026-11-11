@@ -124,6 +124,17 @@ impl ProcessManager {
         });
     }
 
+    /// Sends one control command line to the running engine's stdin.
+    pub fn send_line(&self, line: &str) -> Result<(), String> {
+        use std::io::Write;
+        let mut inner = self.inner.lock().unwrap();
+        if !is_running(&mut inner) {
+            return Err("The recorder isn't running".into());
+        }
+        let stdin = inner.stdin.as_mut().ok_or("The recorder has no command input")?;
+        writeln!(stdin, "{line}").and_then(|_| stdin.flush()).map_err(|e| format!("Could not send \"{line}\": {e}"))
+    }
+
     /// Asks the engine to exit (it finishes open recordings), and kills it only
     /// if it is still running after `timeout`.
     pub fn stop(&self, timeout: Duration) {

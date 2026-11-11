@@ -102,6 +102,17 @@ for the GPL).
   -> Monitor draws a trace and a waterfall, auto-levelled from the noise
   floor, resizable by dragging its bottom edge (height kept in localStorage),
   click to add or open a frequency. Checked on the dongle.
+- Squelch is live: the supervisor compares the new config with the running
+  one with squelch left out (`config_structure`); if only squelch changed it
+  sends `squelch 0 <channel> <dB>` to the engine's stdin instead of
+  restarting. Gain still restarts the engine: live gain fails on Windows
+  (RTL-SDR tuner i2c error -9 while streaming). Squelch 0 = always open
+  (records constantly; the UI warns).
+- Each frequency has a colour (tile swatch, slider, waterfall marker and its
+  squelch line). The squelch line on the trace is the engine's measured
+  noise floor for that channel (spectrum packet v2) + 2 dB per slider step;
+  the dot is its signal level, amber while open. Gain slider in the
+  waterfall header saves on release.
 - "Stop recording" only stops saving: the engine keeps running without file
   outputs (state "monitoring"), so live listening and the waterfall go on.
   Quitting the app releases the dongle.

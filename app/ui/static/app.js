@@ -44,6 +44,9 @@ function fmtMhz(mhz) {
   return s.endsWith("0") ? s.slice(0, -1) : s;
 }
 const label = (f) => (f.name && f.name.trim()) || `${fmtMhz(f.mhz)} MHz`;
+// one colour per frequency (amber stays reserved for "on air")
+const FREQ_COLOURS = ["#3dd6f5", "#e879f9", "#a3e635", "#60a5fa", "#f472b6", "#2dd4bf", "#c084fc", "#fb923c"];
+const freqColour = (f) => FREQ_COLOURS[Math.max(0, station.frequencies.indexOf(f)) % FREQ_COLOURS.length];
 const sameMhz = (a, b) => Math.abs(a - b) < 0.0005;
 const clock = (unix) => new Date(unix * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
 const clockSec = (unix) => new Date(unix * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
@@ -318,8 +321,9 @@ function viewMonitor(main) {
   main.innerHTML = `<div class="page">
     <div id="banners">${bannerHtml()}</div>
     <section class="panel" aria-label="Waterfall">
-      <div class="panel-head"><h2>Waterfall</h2><span class="muted">Everything the dongle hears. Click to add a frequency; drag the bottom edge to resize.</span>
-        <span class="grow"></span><span class="mono" id="wf-readout" style="color:var(--cyan-hi)"></span></div>
+      <div class="panel-head"><h2>Waterfall</h2><span class="muted">Click to add a frequency. Drag the bottom edge to resize.</span>
+        <span class="grow"></span><span class="mono" id="wf-readout" style="color:var(--cyan-hi)"></span>
+        <label class="gain" for="wf-gain">Gain <input type="range" id="wf-gain" min="0" max="49.6" step="0.1" value="${station.receiver.gain_db}"> <b class="mono" id="wf-gain-text">${station.receiver.gain_db.toFixed(1)} dB</b></label></div>
       <div class="wf" id="wf" style="height:${wfHeight()}px">
         <canvas id="wf-trace" class="wf-trace" aria-hidden="true"></canvas>
         <canvas id="wf-canvas" class="wf-canvas" role="img" aria-label="Waterfall of the receiver's band"></canvas>
@@ -434,6 +438,28 @@ function wfTrace() {
   ctx.lineTo(w, h); ctx.lineTo(0, h); ctx.closePath();
   ctx.fillStyle = "rgba(61,214,245,0.12)";
   ctx.fill();
+
+  // each frequency's squelch: the engine's noise floor for it plus the slider's setting
+  ctx.font = "11px Cascadia Mono, Consolas, monospace";
+  for (const f of station.frequencies) {
+    const ch = (wf.channels || []).find((c) => Math.abs(c.freq_hz - f.mhz * 1e6) < 1000);
+    if (!ch || !wf.meta) continue;
+    const colour = freqColour(f);
+    const x = (wfPct(f.mhz) / 100) * w;
+    const thr = ch.noise_db + f.squelch * 2;
+    const ty = y(thr);
+    ctx.strokeStyle = colour;
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x - 26, ty); ctx.lineTo(x + 26, ty); ctx.stroke();
+    ctx.fillStyle = colour;
+    ctx.fillText(`SQ ${f.squelch}`, x + 30, Math.max(10, ty + 4));
+    ctx.beginPath();
+    ctx.arc(x, y(ch.signal_db), 3.5, 0, Math.PI * 2);
+    ctx.fillStyle = ch.open ? "#ffb020" : colour;
+    ctx.fill();
+  }
+  ctx.fillStyle = "#8b9aab";
+  ctx.fillText(`Gain ${station.receiver.gain_db.toFixed(1)} dB`, 6, 13);
 }
 
 const wfLowHz = () => wf.meta.centre_hz - wf.meta.sample_rate / 2;
@@ -442,7 +468,7 @@ const wfPct = (mhz) => ((mhz * 1e6 - wfLowHz()) / wf.meta.sample_rate) * 100;
 function wfMarkers() {
   const box = $("#wf-markers");
   if (!box || !wf.meta) return;
-  box.innerHTML = station.frequencies.map((f) => `<div class="marker" data-marker="${esc(f.id)}" style="left:${wfPct(f.mhz)}%"><div class="flag">${fmtMhz(f.mhz)}${f.name ? " " + esc(f.name) : ""}</div></div>`).join("");
+  box.innerHTML = station.frequencies.map((f) => `<div class="marker" data-marker="${esc(f.id)}" style="left:${wfPct(f.mhz)}%;--fc:${freqColour(f)}"><div class="flag">${fmtMhz(f.mhz)}${f.name ? " " + esc(f.name) : ""}</div></div>`).join("");
   const lo = wfLowHz() / 1e6, span = wf.meta.sample_rate / 1e6;
   $("#band-scale").innerHTML = Array.from({ length: 6 }, (_, i) => `<span>${(lo + (i * span) / 5).toFixed(2)}</span>`).join("");
   updateMonitorLive();
@@ -466,6 +492,7 @@ async function wfPoll() {
     if (retuned) wf.history = [];
     wf.meta = meta;
     wf.since = d.next;
+    wf.channels = d.channels;
     const lines = [];
     for (let i = 0; i < d.count; i++) lines.push(all.subarray(i * d.bins, (i + 1) * d.bins));
     lines.forEach(updateFloor);
@@ -496,6 +523,14 @@ function setupWaterfall() {
     if (near) { location.hash = `#/frequency/${encodeURIComponent(near.id)}`; return; }
     location.hash = `#/frequency/new?mhz=${(Math.round(mhz / 0.0125) * 0.0125).toFixed(4)}`;
   });
+  // a gain change restarts the receiver (about 2 s), so it is saved when the slider is let go
+  $("#wf-gain").addEventListener("input", (e) => { $("#wf-gain-text").textContent = `${Number(e.target.value).toFixed(1)} dB`; });
+  $("#wf-gain").addEventListener("change", (e) => {
+    const g = Number(e.target.value);
+    station.receiver.gain_db = g;
+    saveStation(clone(station), `Gain ${g.toFixed(1)} dB. The receiver restarts for a moment.`);
+  });
+  $(".gain").addEventListener("click", (e) => e.stopPropagation());
   const handle = $("#wf-resize");
   const setHeight = (h, save) => {
     h = Math.max(WF_MIN, Math.min(WF_MAX, Math.round(h)));
@@ -521,9 +556,9 @@ window.addEventListener("resize", () => { if (route.name === "monitor") wfTrace(
 
 function tileHtml(f) {
   const mode = f.modulation === "am" ? "AM" : "FM";
-  return `<article class="tile" data-tile="${esc(f.id)}">
+  return `<article class="tile" data-tile="${esc(f.id)}" style="--fc:${freqColour(f)}">
     <div class="tile-head">
-      <span class="dot"></span><span class="name">${esc(label(f))}</span><span class="tag">${mode}</span>
+      <span class="dot"></span><span class="swatch" aria-hidden="true"></span><span class="name">${esc(label(f))}</span><span class="tag">${mode}</span>
       ${f.ctcss_hz ? `<span class="tag">CTCSS ${f.ctcss_hz}</span>` : ""}${f.record ? "" : '<span class="tag">Not recorded</span>'}
       <span class="tag amber hidden" data-netname></span>
       <span class="grow"></span><span class="state" data-state>IDLE</span>
@@ -533,9 +568,10 @@ function tileHtml(f) {
     <div class="meter" aria-hidden="true"><i data-meter></i></div>
     <div class="squelch">
       <label for="sq-${esc(f.id)}">Squelch</label>
-      <input type="range" id="sq-${esc(f.id)}" min="1" max="9" step="1" value="${f.squelch}" data-squelch-id="${esc(f.id)}">
+      <input type="range" id="sq-${esc(f.id)}" min="0" max="9" step="1" value="${f.squelch}" data-squelch-id="${esc(f.id)}">
       <b class="mono" data-squelch="${esc(f.id)}">${f.squelch}</b>
     </div>
+    <div class="hint edge ${f.squelch === 0 && f.record ? "" : "hidden"}" data-open-warning="${esc(f.id)}">Squelch 0 is always open${f.record ? ": this frequency records constantly" : ""}.</div>
     <div class="strip" data-strip aria-label="Activity in the last 24 hours"></div>
     <div class="strip-scale"><span>24 h ago</span><span>now</span></div>
     <div class="tile-foot">
@@ -831,8 +867,8 @@ function viewFrequency(main) {
           <div class="seg" role="group" aria-labelledby="mode-label"><button type="button" data-act="mode" data-mode="nfm" aria-pressed="${d.modulation !== "am"}">FM</button><button type="button" data-act="mode" data-mode="am" aria-pressed="${d.modulation === "am"}">AM</button></div>
           <span class="hint">FM for ham repeaters and simplex. AM for aviation.</span></div>
         <div class="field"><label for="f-sq">Squelch · <b id="f-sq-text">${d.squelch}</b></label>
-          <input type="range" id="f-sq" min="1" max="9" step="1" value="${d.squelch}">
-          <span class="hint">Like the SQL knob on a handheld: higher needs a stronger signal to start recording. 5 suits most repeaters.</span></div>
+          <input type="range" id="f-sq" min="0" max="9" step="1" value="${d.squelch}">
+          <span class="hint">Like the SQL knob on a handheld: higher needs a stronger signal to start recording. 5 suits most repeaters. 0 is always open and records constantly.</span></div>
         <div class="field"><label for="f-ctcss">Only record with this CTCSS tone</label>
           <select id="f-ctcss"><option value="">Any signal</option>${tones}</select>
           <span class="hint">Ignores other stations on the same frequency. Use your repeater's tone.</span></div>
@@ -987,6 +1023,9 @@ document.addEventListener("input", (e) => {
   if (!f) return;
   f.squelch = Number(e.target.value);
   $(`[data-squelch="${CSS.escape(id)}"]`).textContent = f.squelch;
+  const warn = $(`[data-open-warning="${CSS.escape(id)}"]`);
+  if (warn) warn.classList.toggle("hidden", !(f.squelch === 0 && f.record));
+  wfTrace();
   clearTimeout(squelchTimer);
   squelchTimer = setTimeout(() => saveStation(clone(station), `Squelch ${f.squelch} on ${label(f)}`), 900);
 });

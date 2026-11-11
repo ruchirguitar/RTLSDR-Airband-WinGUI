@@ -390,6 +390,7 @@ async fn get_spectrum(State(app): State<Shared>, Query(q): Query<Since>) -> ApiR
         "bins": last.map(|l| l.db.len()),
         "centre_hz": last.map(|l| l.centre_hz),
         "sample_rate": last.map(|l| l.sample_rate),
+        "channels": last.map(|l| l.channels.clone()).unwrap_or_default(),
         "data": base64::engine::general_purpose::STANDARD.encode(bytes),
     })))
 }

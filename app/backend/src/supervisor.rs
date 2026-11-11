@@ -18,8 +18,13 @@ const DISK_EVERY: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Default)]
 pub struct SupervisorState {
-    /// The config the running engine was started with (None: not started by us).
+    /// The config the running engine was started with (None: not started by us),
+    /// updated when gain or squelch are changed live.
     pub engine_config: Option<String>,
+    /// That config with gain and squelch left out: a change here needs a restart.
+    pub engine_structure: Option<String>,
+    /// Gain and squelch the running engine has, to send only what changed.
+    pub applied: Option<LiveSettings>,
     pub engine_started: Option<Instant>,
     pub engine_started_unix: Option<f64>,
     pub restarts: u32,
@@ -35,6 +40,40 @@ pub struct SupervisorState {
     pub disk_used: Option<u64>,
     pub disk_checked: Option<Instant>,
     pub retention_checked: Option<Instant>,
+}
+
+/// The settings changed on the running engine instead of restarting it
+/// (engine/src/control.h). Gain is not one of them: on Windows the RTL-SDR
+/// rejects tuner writes while it streams (i2c error -9), so a gain change
+/// restarts the engine.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiveSettings {
+    pub squelch: Vec<u8>,
+}
+
+impl LiveSettings {
+    pub fn of(station: &Station) -> Self {
+        LiveSettings { squelch: station.frequencies.iter().map(|f| f.squelch).collect() }
+    }
+
+    /// The commands that turn `self` into `next` (channel i is frequency i).
+    pub fn commands_to(&self, next: &LiveSettings) -> Vec<String> {
+        let mut out = Vec::new();
+        for (i, sq) in next.squelch.iter().enumerate() {
+            if self.squelch.get(i) != Some(sq) {
+                out.push(format!("squelch 0 {i} {}", *sq as f64 * 2.0));
+            }
+        }
+        out
+    }
+}
+
+/// The station's engine config with the live settings fixed, so two stations
+/// that differ only in squelch give the same structure.
+pub fn config_structure(station: &Station, rec_dir: &std::path::Path, active: &[&Net], record: bool) -> String {
+    let mut s = station.clone();
+    s.frequencies.iter_mut().for_each(|f| f.squelch = 5);
+    engine_config(&s, rec_dir, active, record)
 }
 
 pub fn now_unix() -> f64 {
@@ -115,6 +154,8 @@ pub fn tick(app: &AppState, now_local: NaiveDateTime) {
     let active: Vec<&Net> = station.nets.iter().filter(|n| sup.active_nets.contains(&n.id)).collect();
     // recording off still runs the dongle, for live listening and the waterfall
     let config = engine_config(&station, &rec_dir, &active, enabled);
+    let structure = config_structure(&station, &rec_dir, &active, enabled);
+    let live = LiveSettings::of(&station);
     let running = app.process.status().running;
 
     let blocked = if station.frequencies.is_empty() {
@@ -149,6 +190,8 @@ pub fn tick(app: &AppState, now_local: NaiveDateTime) {
                 Ok(()) => {
                     sup.problem = None;
                     sup.engine_config = Some(config.clone());
+                    sup.engine_structure = Some(structure.clone());
+                    sup.applied = Some(live.clone());
                     sup.engine_started = Some(Instant::now());
                     sup.engine_started_unix = Some(now_unix());
                     sup.retry_at = None;
@@ -162,7 +205,18 @@ pub fn tick(app: &AppState, now_local: NaiveDateTime) {
         };
         if running {
             if sup.engine_config.as_deref() != Some(config.as_str()) {
-                start(&mut sup, true);
+                // gain and squelch go to the running engine; anything else needs a restart
+                let commands = match (&sup.applied, sup.engine_structure.as_deref() == Some(structure.as_str())) {
+                    (Some(applied), true) => Some(applied.commands_to(&live)),
+                    _ => None,
+                };
+                match commands.map(|cmds| cmds.iter().try_for_each(|c| app.process.send_line(c))) {
+                    Some(Ok(())) => {
+                        sup.engine_config = Some(config.clone());
+                        sup.applied = Some(live.clone());
+                    }
+                    _ => start(&mut sup, true),
+                }
             } else if sup.engine_started.is_some_and(|t| t.elapsed() > HEALTHY_AFTER) {
                 sup.backoff_sec = 0;
                 sup.problem = None;
@@ -268,6 +322,26 @@ mod tests {
         assert!(explain_exit(&lines(&["Configuration error: devices.[0]: gain is weird"])).contains("gain is weird"));
         assert_eq!(explain_exit(&lines(&["something odd", "[process exited with code 1]"])), "The recorder stopped unexpectedly: something odd");
         assert_eq!(explain_exit(&[]), "The recorder stopped unexpectedly.");
+    }
+
+    #[test]
+    fn squelch_changes_without_a_restart() {
+        let mut s = station();
+        s.frequencies.push(Frequency { id: "b".into(), mhz: 145.2, ..Default::default() });
+        let dir = std::path::Path::new("C:/rec");
+        let before = LiveSettings::of(&s);
+        let structure = config_structure(&s, dir, &[], true);
+
+        s.frequencies[1].squelch = 7;
+        assert_eq!(config_structure(&s, dir, &[], true), structure, "same structure: no restart");
+        assert_eq!(before.commands_to(&LiveSettings::of(&s)), vec!["squelch 0 1 14"]);
+        assert!(before.commands_to(&before).is_empty());
+
+        s.receiver.gain_db = 40.2;
+        assert_ne!(config_structure(&s, dir, &[], true), structure, "gain needs a restart");
+        s.receiver.gain_db = 30.0;
+        s.frequencies[1].mhz = 145.25;
+        assert_ne!(config_structure(&s, dir, &[], true), structure, "a new frequency needs a restart");
     }
 
     #[test]

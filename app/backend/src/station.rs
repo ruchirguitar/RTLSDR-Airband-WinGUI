@@ -58,7 +58,7 @@ pub struct Frequency {
     pub mhz: f64,
     pub name: String,
     pub modulation: Modulation,
-    /// 1 (opens on weak signals) to 9 (strong signals only), 2 dB SNR per step.
+    /// 0 (always open, like SQL 0 on a handheld) to 9 (strong signals only), 2 dB SNR per step.
     pub squelch: u8,
     pub record: bool,
     pub ctcss_hz: Option<f64>,
@@ -241,8 +241,8 @@ impl Station {
             if f.name.chars().count() > 40 {
                 errors.push(format!("{label}: the name can be at most 40 characters."));
             }
-            if !(1..=9).contains(&f.squelch) {
-                errors.push(format!("{label}: squelch must be between 1 and 9."));
+            if f.squelch > 9 {
+                errors.push(format!("{label}: squelch must be between 0 and 9."));
             }
             if let Some(tone) = f.ctcss_hz {
                 if !CTCSS_TONES.iter().any(|t| (t - tone).abs() < 0.05) {
@@ -449,11 +449,11 @@ mod tests {
     #[test]
     fn validation_catches_mistakes() {
         let mut s = Station { frequencies: vec![freq(145.4, "A"), freq(145.4, "B"), freq(150.0, "C")], ..Default::default() };
-        s.frequencies[0].squelch = 0;
+        s.frequencies[0].squelch = 10;
         s.frequencies[1].ctcss_hz = Some(88.0);
         s.nets.push(Net { name: "Morning".into(), mhz: 146.0, start: "07:00".into(), end: "07:00".into(), days: vec![], ..Default::default() });
         let e = s.validate().join("\n");
-        assert!(e.contains("squelch must be between 1 and 9"), "{e}");
+        assert!(e.contains("squelch must be between 0 and 9"), "{e}");
         assert!(e.contains("88 Hz is not a standard CTCSS tone"), "{e}");
         assert!(e.contains("145.400 MHz is in the list twice"), "{e}");
         assert!(e.contains("150.000 MHz is too far"), "{e}");
