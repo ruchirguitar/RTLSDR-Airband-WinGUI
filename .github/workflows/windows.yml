@@ -1,0 +1,77 @@
+name: Windows app
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+    - name: Checkout (with engine submodule)
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 0
+
+    - name: Set up MSYS2 (UCRT64)
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: UCRT64
+        update: true
+        install: >-
+          git
+          mingw-w64-ucrt-x86_64-gcc
+          mingw-w64-ucrt-x86_64-cmake
+          mingw-w64-ucrt-x86_64-ninja
+          mingw-w64-ucrt-x86_64-pkgconf
+          mingw-w64-ucrt-x86_64-libconfig
+          mingw-w64-ucrt-x86_64-lame
+          mingw-w64-ucrt-x86_64-libshout
+          mingw-w64-ucrt-x86_64-fftw
+          mingw-w64-ucrt-x86_64-rtl-sdr
+          mingw-w64-ucrt-x86_64-soapysdr
+
+    - name: Build engine
+      shell: msys2 {0}
+      run: |
+        git config --global --add safe.directory "$(pwd)/engine"
+        cd engine
+        cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DNFM=TRUE -DPLATFORM=generic -DPULSEAUDIO=OFF
+        cmake --build build -j4 -- -k 0
+        ./build/src/rtl_airband.exe -v
+
+    - name: Bundle engine exe + DLLs into the app
+      shell: msys2 {0}
+      run: |
+        out=app/src-tauri/engine-bin
+        cp engine/build/src/rtl_airband.exe "$out/"
+        ldd engine/build/src/rtl_airband.exe | awk '/ucrt64/ {print $3}' | xargs -r -I{} cp {} "$out/"
+        if [ -d /ucrt64/lib/SoapySDR ]; then cp -r /ucrt64/lib/SoapySDR "$out/"; fi
+        ls -la "$out"
+
+    - name: Engine runs outside MSYS2
+      run: .\app\src-tauri\engine-bin\rtl_airband.exe -v
+
+    - name: Rust cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: app
+
+    - name: Backend tests
+      working-directory: app
+      run: cargo test -p airband-backend
+
+    - name: Build installer
+      working-directory: app/src-tauri
+      run: npx --yes @tauri-apps/cli@2 build
+
+    - name: Upload installers
+      uses: actions/upload-artifact@v4
+      with:
+        name: airband-recorder-windows-installer
+        path: |
+          app/target/release/bundle/nsis/*.exe
+          app/target/release/bundle/msi/*.msi

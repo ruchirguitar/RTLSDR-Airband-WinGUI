@@ -37,4 +37,33 @@ Devices**, select **"Bulk-In, Interface (Interface 0)"**, pick **WinUSB**, and c
 
 ## 4. The desktop app
 
-Not written yet. This section will cover installing Rust and the Tauri build.
+Install [Rust](https://rustup.rs/) (default options) and [Node.js](https://nodejs.org/) LTS.
+Then, in the UCRT64 window, copy the engine and its DLLs into the app:
+
+```bash
+cd RTLSDR-Airband-WinGUI
+out=app/src-tauri/engine-bin
+cp engine/build/src/rtl_airband.exe "$out/"
+ldd engine/build/src/rtl_airband.exe | awk '/ucrt64/ {print $3}' | xargs -r -I{} cp {} "$out/"
+cp -r /ucrt64/lib/SoapySDR "$out/" 2>/dev/null || true
+```
+
+and in a normal PowerShell window:
+
+```powershell
+cd RTLSDR-Airband-WinGUI\app
+cargo test -p airband-backend           # backend tests
+cd src-tauri
+npx --yes @tauri-apps/cli@2 dev         # run the app from source
+npx --yes @tauri-apps/cli@2 build       # make the installers
+```
+
+Installers land in `app\target\release\bundle\nsis\` (`.exe`) and `...\bundle\msi\`.
+
+## Where the app keeps things
+
+| What | Where |
+|---|---|
+| Configs (seeded from the samples on first run) | `%APPDATA%\org.rtlairband.wingui\configs\` |
+| App settings | `%APPDATA%\org.rtlairband.wingui\state.json` |
+| Recordings (default) | `Documents\airband-recordings\` |
