@@ -40,6 +40,20 @@ pub struct SupervisorState {
     pub disk_used: Option<u64>,
     pub disk_checked: Option<Instant>,
     pub retention_checked: Option<Instant>,
+    /// Frequency id -> the last-heard time seen at the previous tick, to spot new activity.
+    pub activity_seen: HashMap<String, f64>,
+}
+
+/// A frequency counts as newly active when it is heard after this much quiet.
+pub const NOTIFY_QUIET_SEC: f64 = 120.0;
+
+/// True when `heard` is new activity after at least `quiet_sec` of silence since `prev`.
+pub fn new_activity(prev: Option<f64>, heard: Option<f64>, quiet_sec: f64) -> bool {
+    match (prev, heard) {
+        (None, Some(_)) => true,
+        (Some(p), Some(h)) => h - p > quiet_sec,
+        _ => false,
+    }
 }
 
 /// The settings changed on the running engine instead of restarting it
@@ -143,9 +157,25 @@ pub fn tick(app: &AppState, now_local: NaiveDateTime) {
     sup.watching_since_unix.get_or_insert(now);
 
     let heard = activities(app, &station);
-    for a in &heard {
+    let mut notices = Vec::new();
+    for (i, a) in heard.iter().enumerate() {
         if let Some(t) = a.last_heard_unix {
             sup.last_heard_any = Some(sup.last_heard_any.map_or(t, |old: f64| old.max(t)));
+        }
+        if let (Some(f), Some(t)) = (station.frequencies.get(i), a.last_heard_unix) {
+            let prev = sup.activity_seen.insert(f.id.clone(), t);
+            if f.notify && new_activity(prev, Some(t), NOTIFY_QUIET_SEC) {
+                let what = if f.name.trim().is_empty() { format!("{} MHz", crate::station::fmt_mhz(f.mhz)) } else { format!("{} ({} MHz)", f.name.trim(), crate::station::fmt_mhz(f.mhz)) };
+                notices.push((format!("{what} is active"), if enabled && f.record { "Recording now.".to_string() } else { "Not being recorded.".to_string() }));
+            }
+        }
+    }
+    if !notices.is_empty() {
+        let notifier = app.notifier.lock().unwrap().clone();
+        if let Some(notify) = notifier {
+            for (title, body) in &notices {
+                notify(title, body);
+            }
         }
     }
     let last_heard = |mhz: f64| station.frequency_for(mhz).and_then(|(i, _)| heard.get(i)).and_then(|a| if a.on_air { Some(now) } else { a.last_heard_unix });
@@ -342,6 +372,15 @@ mod tests {
         s.receiver.gain_db = 30.0;
         s.frequencies[1].mhz = 145.25;
         assert_ne!(config_structure(&s, dir, &[], true), structure, "a new frequency needs a restart");
+    }
+
+    #[test]
+    fn activity_after_a_quiet_spell_is_new() {
+        assert!(new_activity(None, Some(100.0), 120.0), "first time heard");
+        assert!(!new_activity(Some(100.0), Some(102.0), 120.0), "the same conversation");
+        assert!(new_activity(Some(100.0), Some(300.0), 120.0), "after over two minutes of quiet");
+        assert!(!new_activity(Some(100.0), None, 120.0));
+        assert!(!new_activity(None, None, 120.0));
     }
 
     #[test]

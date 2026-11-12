@@ -35,11 +35,13 @@ pub struct Receiver {
     pub device_index: u32,
     pub gain_db: f64,
     pub correction_ppm: i32,
+    /// Waterfall lines per second (5 to 30).
+    pub spectrum_rate: u32,
 }
 
 impl Default for Receiver {
     fn default() -> Self {
-        Receiver { device_index: 0, gain_db: 30.0, correction_ppm: 0 }
+        Receiver { device_index: 0, gain_db: 30.0, correction_ppm: 0, spectrum_rate: SPECTRUM_LINES_PER_SEC }
     }
 }
 
@@ -62,11 +64,13 @@ pub struct Frequency {
     pub squelch: u8,
     pub record: bool,
     pub ctcss_hz: Option<f64>,
+    /// A Windows notification when it becomes active after a quiet spell.
+    pub notify: bool,
 }
 
 impl Default for Frequency {
     fn default() -> Self {
-        Frequency { id: String::new(), mhz: 0.0, name: String::new(), modulation: Modulation::Nfm, squelch: 5, record: true, ctcss_hz: None }
+        Frequency { id: String::new(), mhz: 0.0, name: String::new(), modulation: Modulation::Nfm, squelch: 5, record: true, ctcss_hz: None, notify: false }
     }
 }
 
@@ -122,11 +126,13 @@ pub struct Settings {
     pub silence_warning_hours: u32,
     pub autostart: bool,
     pub close_to_tray: bool,
+    /// "system", "light" or "dark".
+    pub theme: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { recordings_dir: String::new(), retention_days: 90, local_time: true, silence_warning_hours: 24, autostart: false, close_to_tray: true }
+        Settings { recordings_dir: String::new(), retention_days: 90, local_time: true, silence_warning_hours: 24, autostart: false, close_to_tray: true, theme: "system".into() }
     }
 }
 
@@ -232,6 +238,12 @@ impl Station {
         }
         if !(-200..=200).contains(&r.correction_ppm) {
             errors.push("Correction must be between -200 and 200 ppm.".into());
+        }
+        if !(5..=30).contains(&r.spectrum_rate) {
+            errors.push("Waterfall speed must be 5 to 30 lines a second.".into());
+        }
+        if !["system", "light", "dark"].contains(&self.settings.theme.as_str()) {
+            errors.push("Theme must be system, light or dark.".into());
         }
         for (i, f) in self.frequencies.iter().enumerate() {
             let label = if f.name.trim().is_empty() { fmt_mhz(f.mhz) } else { f.name.clone() };
@@ -354,7 +366,7 @@ pub fn engine_config(station: &Station, recordings_dir: &Path, active_nets: &[&N
     c.push_str("devices:\n(\n  {\n    type = \"rtlsdr\";\n");
     c.push_str(&format!("    index = {};\n    gain = {};\n    correction = {};\n", s.receiver.device_index, fl(s.receiver.gain_db), s.receiver.correction_ppm));
     c.push_str(&format!("    centerfreq = {};\n", fl(centre)));
-    c.push_str(&format!("    spectrum = {{ dest_address = \"127.0.0.1\"; dest_port = {SPECTRUM_PORT}; rate = {SPECTRUM_LINES_PER_SEC}; }};\n"));
+    c.push_str(&format!("    spectrum = {{ dest_address = \"127.0.0.1\"; dest_port = {SPECTRUM_PORT}; rate = {}; }};\n", s.receiver.spectrum_rate));
     c.push_str("    channels:\n    (\n");
     for (i, f) in s.frequencies.iter().enumerate() {
         let freq = fmt_mhz(f.mhz);
@@ -500,6 +512,7 @@ mod tests {
         let dev = &tree["devices"][0];
         assert_eq!(dev["centerfreq"]["value"], 145.3);
         assert_eq!(dev["spectrum"]["dest_port"]["value"], 17299);
+        assert_eq!(dev["spectrum"]["rate"]["value"], 15);
         assert_eq!(dev["gain"]["type"], "float");
         let ch0 = &dev["channels"][0];
         assert_eq!(ch0["label"]["value"], "Repeater \"A\"");

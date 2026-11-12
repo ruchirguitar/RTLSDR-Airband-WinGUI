@@ -53,7 +53,11 @@ pub struct AppState {
     pub supervisor: Mutex<supervisor::SupervisorState>,
     station: Mutex<Station>,
     recording_enabled: Mutex<bool>,
+    /// Shows a desktop notification (title, body); set by the Windows shell.
+    pub notifier: Mutex<Option<Notifier>>,
 }
+
+pub type Notifier = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 type Shared = Arc<AppState>;
 
@@ -116,6 +120,7 @@ impl AppState {
             supervisor: Mutex::new(Default::default()),
             station: Mutex::new(station),
             recording_enabled: Mutex::new(prefs.recording_enabled),
+            notifier: Mutex::new(None),
         })
     }
 
@@ -231,10 +236,12 @@ async fn get_status(State(app): State<Shared>) -> ApiResult {
     let state = if s.frequencies.is_empty() {
         "setup"
     } else if running && sup.engine_started.is_some_and(|t| t.elapsed() >= STARTING_FOR) {
+        // armed: auto-record is on and waits for squelch to open; what is
+        // being written right now is each frequency's `recording`
         if enabled {
-            "recording"
+            "armed"
         } else {
-            "monitoring"
+            "listening"
         }
     } else if running {
         "starting"
@@ -251,13 +258,14 @@ async fn get_status(State(app): State<Shared>) -> ApiResult {
             let port = LIVE_PORT_BASE + i as u16;
             let a = app.live.get(port).activity();
             let net = active_nets.iter().find(|n| (n.mhz - f.mhz).abs() < 0.0005).map(|n| n.name.clone());
-            json!({"id": f.id, "mhz": f.mhz, "name": f.name, "port": port, "on_air": a.on_air && running, "level_dbfs": a.level_dbfs, "last_heard_unix": a.last_heard_unix, "net": net})
+            let on_air = a.on_air && running;
+            json!({"id": f.id, "mhz": f.mhz, "name": f.name, "port": port, "on_air": on_air, "recording": on_air && enabled && f.record, "level_dbfs": a.level_dbfs, "last_heard_unix": a.last_heard_unix, "net": net})
         })
         .collect();
 
     let mut warnings = Vec::new();
     let hours = s.settings.silence_warning_hours;
-    if (state == "recording" || state == "monitoring") && hours > 0 {
+    if (state == "armed" || state == "listening") && hours > 0 {
         let reference = sup.last_heard_any.unwrap_or(0.0).max(sup.watching_since_unix.unwrap_or(now));
         if now - reference > hours as f64 * 3600.0 {
             warnings.push(format!("Nothing has been heard on any frequency for over {hours} hours. Check the antenna and the dongle."));

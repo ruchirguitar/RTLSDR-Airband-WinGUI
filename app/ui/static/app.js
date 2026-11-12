@@ -135,19 +135,27 @@ function render() {
 
 function updateChrome() {
   if (!status) return;
-  const pill = $("#status-pill"), text = $("#status-text"), btn = $("#btn-recording");
+  const pill = $("#status-pill"), text = $("#status-text");
   const st = status.state;
-  pill.className = "pill " + ({ recording: "ok", starting: "warn", waiting: "bad", monitoring: "warn" }[st] || "");
-  text.textContent = {
-    recording: `Recording · ${status.started_unix ? uptime(status.started_unix) : ""}`,
-    monitoring: "Listening only · not recording",
-    starting: "Starting…",
-    waiting: "Receiver not running",
-    setup: "Add a frequency to start",
-  }[st] || st;
-  btn.classList.toggle("hidden", st === "setup");
-  btn.textContent = status.recording_enabled ? "Stop recording" : "Start recording";
-  btn.classList.toggle("primary", !status.recording_enabled);
+  // the pill says what is happening right now: red only while a file is being written
+  const writing = status.frequencies.filter((f) => f.recording);
+  const n = status.frequencies.length;
+  if (st === "armed" && writing.length) {
+    pill.className = "pill rec";
+    text.textContent = `Recording ${writing.map((f) => fmtMhz(f.mhz)).join(", ")}`;
+  } else {
+    pill.className = "pill " + ({ armed: "armed", listening: "idle", starting: "warn", waiting: "bad" }[st] || "");
+    text.textContent = {
+      armed: `Armed · watching ${n} frequenc${n === 1 ? "y" : "ies"}`,
+      listening: "Listen only · nothing saved",
+      starting: "Starting…",
+      waiting: "Receiver not running",
+      setup: "Add a frequency to start",
+    }[st] || st;
+  }
+  pill.title = status.started_unix ? `Receiver ${uptime(status.started_unix)}` : "";
+  $("#mode-switch").classList.toggle("hidden", st === "setup");
+  $$("#mode-switch button").forEach((b) => b.setAttribute("aria-pressed", (b.dataset.mode === "auto") === status.recording_enabled));
   const net = $("#net-pill");
   net.classList.toggle("hidden", !status.active_nets.length);
   net.textContent = status.active_nets.length ? `● ${status.active_nets.join(", ")}` : "";
@@ -321,9 +329,11 @@ function viewMonitor(main) {
   main.innerHTML = `<div class="page">
     <div id="banners">${bannerHtml()}</div>
     <section class="panel" aria-label="Waterfall">
-      <div class="panel-head"><h2>Waterfall</h2><span class="muted">Click to add a frequency. Drag the bottom edge to resize.</span>
+      <div class="panel-head"><h2>Waterfall</h2><span class="muted">Click to add a frequency. Drag a coloured squelch line to set it. Ctrl + wheel zooms.</span>
         <span class="grow"></span><span class="mono" id="wf-readout" style="color:var(--cyan-hi)"></span>
         <label class="gain" for="wf-gain">Gain <input type="range" id="wf-gain" min="0" max="49.6" step="0.1" value="${station.receiver.gain_db}"> <b class="mono" id="wf-gain-text">${station.receiver.gain_db.toFixed(1)} dB</b></label></div>
+      ${wfToolsHtml()}
+      <div class="wf-hint hidden" id="wf-hint" role="status"></div>
       <div class="wf" id="wf" style="height:${wfHeight()}px">
         <canvas id="wf-trace" class="wf-trace" aria-hidden="true"></canvas>
         <canvas id="wf-canvas" class="wf-canvas" role="img" aria-label="Waterfall of the receiver's band"></canvas>
@@ -351,11 +361,41 @@ function viewMonitor(main) {
 
 // ---------- waterfall ----------
 
-const WF_MIN = 140, WF_MAX = 900, WF_DEFAULT = 300, WF_RANGE_DB = 45;
-const wf = { history: [], since: 0, meta: null, floor: null, timer: null, lut: null };
+const WF_MIN = 140, WF_MAX = 900, WF_DEFAULT = 300, WF_AUTO_RANGE_DB = 45, WF_MIN_RANGE_DB = 6;
+const wf = {
+  history: [], since: 0, meta: null, floor: null, timer: null, lut: null, channels: [],
+  peak: null, suppressClick: false, drag: null,
+  // per-viewer display settings, kept in this browser
+  opts: { auto: true, floor: -95, ceil: -50, contrast: 1, peak: false, lo: 0, hi: 1 },
+};
+
+function wfLoadOpts() {
+  try { Object.assign(wf.opts, JSON.parse(localStorage.getItem("wfOpts") || "{}")); } catch { /* defaults */ }
+}
+function wfSaveOpts() {
+  try { localStorage.setItem("wfOpts", JSON.stringify(wf.opts)); } catch { /* private window */ }
+}
+wfLoadOpts();
 
 function wfHeight() {
   try { return Math.max(WF_MIN, Math.min(WF_MAX, Number(localStorage.getItem("wfHeight")) || WF_DEFAULT)); } catch { return WF_DEFAULT; }
+}
+
+/** The colour scale in dB: automatic from the noise floor, or the user's floor and ceiling. */
+function wfLevels() {
+  if (wf.opts.auto) {
+    const floor = wf.floor ?? -100;
+    return { floor, ceil: floor + WF_AUTO_RANGE_DB };
+  }
+  return { floor: wf.opts.floor, ceil: Math.max(wf.opts.ceil, wf.opts.floor + WF_MIN_RANGE_DB) };
+}
+
+/** The bins in view: [first, end). */
+function wfBins() {
+  const bins = wf.meta.bins;
+  let b0 = Math.floor(wf.opts.lo * bins), b1 = Math.ceil(wf.opts.hi * bins);
+  if (b1 - b0 < 8) { b1 = Math.min(bins, b0 + 8); b0 = b1 - 8; }
+  return [Math.max(0, b0), Math.min(bins, b1)];
 }
 
 function wfLut() {
@@ -372,14 +412,16 @@ function wfLut() {
   return (wf.lut = lut);
 }
 
-function wfRow(line, img, row) {
-  const lut = wfLut(), floor = wf.floor ?? -100;
+function wfRow(line, img, row, b0, lv) {
+  const lut = wfLut(), span = lv.ceil - lv.floor, gamma = wf.opts.contrast;
   const off = row * img.width * 4;
   for (let x = 0; x < img.width; x++) {
-    const v = Math.max(0, Math.min(255, Math.round(((line[x] - floor) / WF_RANGE_DB) * 255)));
-    img.data[off + x * 4] = lut[v * 3];
-    img.data[off + x * 4 + 1] = lut[v * 3 + 1];
-    img.data[off + x * 4 + 2] = lut[v * 3 + 2];
+    let v = (line[b0 + x] - lv.floor) / span;
+    v = v <= 0 ? 0 : v >= 1 ? 1 : gamma === 1 ? v : Math.pow(v, gamma);
+    const i = Math.round(v * 255) * 3;
+    img.data[off + x * 4] = lut[i];
+    img.data[off + x * 4 + 1] = lut[i + 1];
+    img.data[off + x * 4 + 2] = lut[i + 2];
     img.data[off + x * 4 + 3] = 255;
   }
 }
@@ -390,15 +432,22 @@ function updateFloor(line) {
   wf.floor = wf.floor == null ? noise : wf.floor * 0.95 + noise * 0.05;
 }
 
+function updatePeak(line) {
+  if (!wf.peak || wf.peak.length !== line.length) wf.peak = Float32Array.from(line);
+  const decay = 6 / ((station && station.receiver.spectrum_rate) || 15); // about 6 dB a second
+  for (let i = 0; i < line.length; i++) wf.peak[i] = Math.max(line[i], wf.peak[i] - decay);
+}
+
 function wfRedraw() {
   const canvas = $("#wf-canvas");
   if (!canvas || !wf.meta) return;
+  const [b0, b1] = wfBins(), lv = wfLevels();
   const h = canvas.clientHeight || 1;
-  canvas.width = wf.meta.bins;
+  canvas.width = b1 - b0;
   canvas.height = h;
   const ctx = canvas.getContext("2d");
   const img = ctx.createImageData(canvas.width, h);
-  for (let r = 0; r < h && r < wf.history.length; r++) wfRow(wf.history[wf.history.length - 1 - r], img, r);
+  for (let r = 0; r < h && r < wf.history.length; r++) wfRow(wf.history[wf.history.length - 1 - r], img, r, b0, lv);
   ctx.putImageData(img, 0, 0);
   wfTrace();
   wfMarkers();
@@ -407,31 +456,62 @@ function wfRedraw() {
 function wfAppend(lines) {
   const canvas = $("#wf-canvas");
   if (!canvas || !lines.length) return;
-  if (canvas.width !== wf.meta.bins || canvas.height !== canvas.clientHeight) return wfRedraw();
-  const ctx = canvas.getContext("2d");
+  const [b0, b1] = wfBins();
+  if (canvas.width !== b1 - b0 || canvas.height !== canvas.clientHeight) return wfRedraw();
+  const ctx = canvas.getContext("2d"), lv = wfLevels();
   const n = Math.min(lines.length, canvas.height);
   ctx.drawImage(canvas, 0, 0, canvas.width, canvas.height - n, 0, n, canvas.width, canvas.height - n);
   const img = ctx.createImageData(canvas.width, n);
-  for (let r = 0; r < n; r++) wfRow(lines[lines.length - 1 - r], img, r);
+  for (let r = 0; r < n; r++) wfRow(lines[lines.length - 1 - r], img, r, b0, lv);
   ctx.putImageData(img, 0, 0);
   wfTrace();
+}
+
+/** Trace geometry shared by drawing and squelch-line dragging. */
+function wfTraceScale(h) {
+  const lv = wfLevels(), lo = lv.floor - 3, span = lv.ceil - lv.floor + 6;
+  return {
+    y: (v) => h - Math.max(0, Math.min(1, (v - lo) / span)) * (h - 4) - 2,
+    db: (y) => lo + ((h - 2 - y) / (h - 4)) * span,
+  };
+}
+
+function wfSquelchLines(w, h) {
+  const sc = wfTraceScale(h);
+  const out = [];
+  for (const f of station.frequencies) {
+    const ch = (wf.channels || []).find((c) => Math.abs(c.freq_hz - f.mhz * 1e6) < 1000);
+    const pct = wfPct(f.mhz);
+    if (!ch || pct < 0 || pct > 100) continue;
+    out.push({ f, ch, x: (pct / 100) * w, y: sc.y(ch.noise_db + f.squelch * 2) });
+  }
+  return out;
 }
 
 function wfTrace() {
   const c = $("#wf-trace");
   const line = wf.history[wf.history.length - 1];
-  if (!c || !line) return;
+  if (!c || !line || !wf.meta) return;
   const w = c.clientWidth, h = c.clientHeight, dpr = window.devicePixelRatio || 1;
   c.width = w * dpr; c.height = h * dpr;
   const ctx = c.getContext("2d");
   ctx.scale(dpr, dpr);
-  const floor = wf.floor ?? -100;
-  const y = (v) => h - Math.max(0, Math.min(1, (v - floor + 5) / (WF_RANGE_DB + 10))) * (h - 4) - 2;
-  ctx.beginPath();
-  for (let i = 0; i < line.length; i++) {
-    const x = (i / (line.length - 1)) * w;
-    i ? ctx.lineTo(x, y(line[i])) : ctx.moveTo(x, y(line[i]));
+  const { y } = wfTraceScale(h);
+  const [b0, b1] = wfBins(), n = b1 - b0;
+  const path = (data) => {
+    ctx.beginPath();
+    for (let i = 0; i < n; i++) {
+      const x = n > 1 ? (i / (n - 1)) * w : 0;
+      i ? ctx.lineTo(x, y(data[b0 + i])) : ctx.moveTo(x, y(data[b0 + i]));
+    }
+  };
+  if (wf.opts.peak && wf.peak) {
+    path(wf.peak);
+    ctx.strokeStyle = "rgba(255,176,32,0.55)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
   }
+  path(line);
   ctx.strokeStyle = "#8be8fa";
   ctx.lineWidth = 1.2;
   ctx.stroke();
@@ -439,23 +519,19 @@ function wfTrace() {
   ctx.fillStyle = "rgba(61,214,245,0.12)";
   ctx.fill();
 
-  // each frequency's squelch: the engine's noise floor for it plus the slider's setting
+  // each frequency's squelch: the engine's noise floor for it plus 2 dB per slider step; drag it to change
   ctx.font = "11px Cascadia Mono, Consolas, monospace";
-  for (const f of station.frequencies) {
-    const ch = (wf.channels || []).find((c) => Math.abs(c.freq_hz - f.mhz * 1e6) < 1000);
-    if (!ch || !wf.meta) continue;
-    const colour = freqColour(f);
-    const x = (wfPct(f.mhz) / 100) * w;
-    const thr = ch.noise_db + f.squelch * 2;
-    const ty = y(thr);
+  for (const s of wfSquelchLines(w, h)) {
+    const colour = freqColour(s.f);
+    const active = wf.drag && wf.drag.id === s.f.id;
     ctx.strokeStyle = colour;
-    ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.moveTo(x - 26, ty); ctx.lineTo(x + 26, ty); ctx.stroke();
+    ctx.lineWidth = active ? 3 : 2;
+    ctx.beginPath(); ctx.moveTo(s.x - 26, s.y); ctx.lineTo(s.x + 26, s.y); ctx.stroke();
     ctx.fillStyle = colour;
-    ctx.fillText(`SQ ${f.squelch}`, x + 30, Math.max(10, ty + 4));
+    ctx.fillText(`SQ ${s.f.squelch}`, s.x + 30, Math.max(10, s.y + 4));
     ctx.beginPath();
-    ctx.arc(x, y(ch.signal_db), 3.5, 0, Math.PI * 2);
-    ctx.fillStyle = ch.open ? "#ffb020" : colour;
+    ctx.arc(s.x, y(s.ch.signal_db), 3.5, 0, Math.PI * 2);
+    ctx.fillStyle = s.ch.open ? "#ffb020" : colour;
     ctx.fill();
   }
   ctx.fillStyle = "#8b9aab";
@@ -463,20 +539,42 @@ function wfTrace() {
 }
 
 const wfLowHz = () => wf.meta.centre_hz - wf.meta.sample_rate / 2;
-const wfPct = (mhz) => ((mhz * 1e6 - wfLowHz()) / wf.meta.sample_rate) * 100;
+const wfPct = (mhz) => (((mhz * 1e6 - wfLowHz()) / wf.meta.sample_rate - wf.opts.lo) / (wf.opts.hi - wf.opts.lo)) * 100;
 
 function wfMarkers() {
   const box = $("#wf-markers");
   if (!box || !wf.meta) return;
-  box.innerHTML = station.frequencies.map((f) => `<div class="marker" data-marker="${esc(f.id)}" style="left:${wfPct(f.mhz)}%;--fc:${freqColour(f)}"><div class="flag">${fmtMhz(f.mhz)}${f.name ? " " + esc(f.name) : ""}</div></div>`).join("");
-  const lo = wfLowHz() / 1e6, span = wf.meta.sample_rate / 1e6;
-  $("#band-scale").innerHTML = Array.from({ length: 6 }, (_, i) => `<span>${(lo + (i * span) / 5).toFixed(2)}</span>`).join("");
+  box.innerHTML = station.frequencies.map((f) => {
+    const pct = wfPct(f.mhz);
+    return pct < 0 || pct > 100 ? "" : `<div class="marker" data-marker="${esc(f.id)}" style="left:${pct}%;--fc:${freqColour(f)}"><div class="flag">${fmtMhz(f.mhz)}${f.name ? " " + esc(f.name) : ""}</div></div>`;
+  }).join("");
+  const sr = wf.meta.sample_rate, lo = (wfLowHz() + wf.opts.lo * sr) / 1e6, span = ((wf.opts.hi - wf.opts.lo) * sr) / 1e6;
+  const digits = span < 0.3 ? 3 : 2;
+  $("#band-scale").innerHTML = Array.from({ length: 6 }, (_, i) => `<span>${(lo + (i * span) / 5).toFixed(digits)}</span>`).join("");
   updateMonitorLive();
 }
 
 function wfFreqAt(clientX) {
   const r = $("#wf").getBoundingClientRect();
-  return (wfLowHz() + ((clientX - r.left) / r.width) * wf.meta.sample_rate) / 1e6;
+  const frac = wf.opts.lo + ((clientX - r.left) / r.width) * (wf.opts.hi - wf.opts.lo);
+  return (wfLowHz() + frac * wf.meta.sample_rate) / 1e6;
+}
+
+/** Tips for the gain, from the latest lines. */
+function wfGainHint() {
+  const el = $("#wf-hint");
+  if (!el) return;
+  const recent = wf.history.slice(-15);
+  if (!recent.length || wf.floor == null) { el.classList.add("hidden"); return; }
+  let peak = -200;
+  for (const l of recent) for (let i = 0; i < l.length; i++) if (l[i] > peak) peak = l[i];
+  const noise = wf.floor + 3, gain = station.receiver.gain_db;
+  let msg = "";
+  if (peak > -8) msg = `A very strong signal (${peak.toFixed(0)} dB) is close to overloading the dongle. Lower the gain a few dB to keep it clean.`;
+  else if (noise > -55) msg = `The noise floor is high (${noise.toFixed(0)} dB). Lowering the gain usually makes signals stand out more.`;
+  else if (gain < 12 && noise < -100) msg = "The gain is very low: weak stations may not open the squelch. Try 25–35 dB.";
+  el.textContent = msg;
+  el.classList.toggle("hidden", !msg);
 }
 
 async function wfPoll() {
@@ -489,40 +587,124 @@ async function wfPoll() {
     const all = new Float32Array(raw.buffer);
     const meta = { bins: d.bins, centre_hz: d.centre_hz, sample_rate: d.sample_rate };
     const retuned = !wf.meta || wf.meta.bins !== meta.bins || wf.meta.centre_hz !== meta.centre_hz;
-    if (retuned) wf.history = [];
+    if (retuned) { wf.history = []; wf.peak = null; }
     wf.meta = meta;
     wf.since = d.next;
     wf.channels = d.channels;
     const lines = [];
     for (let i = 0; i < d.count; i++) lines.push(all.subarray(i * d.bins, (i + 1) * d.bins));
-    lines.forEach(updateFloor);
+    lines.forEach((l) => { updateFloor(l); updatePeak(l); });
     wf.history.push(...lines);
     if (wf.history.length > WF_MAX) wf.history.splice(0, wf.history.length - WF_MAX);
+    if (wf.opts.auto) wfShowLevels();
     retuned ? wfRedraw() : wfAppend(lines);
+    wfGainHint();
   } catch { /* engine restarting */ }
+}
+
+// ----- toolbar -----
+
+function wfToolsHtml() {
+  const o = wf.opts, rate = station.receiver.spectrum_rate || 15;
+  return `<div class="wf-tools" id="wf-tools">
+    <div class="grp" role="group" aria-label="Colour levels">
+      <button type="button" class="chip" id="wf-auto" aria-pressed="${o.auto}" title="Set the levels from the noise floor automatically">Auto levels</button>
+      <label for="wf-floor">Floor</label><input type="range" id="wf-floor" min="-130" max="-10" step="1" value="${o.floor}"><b id="wf-floor-text"></b>
+      <label for="wf-ceil">Ceiling</label><input type="range" id="wf-ceil" min="-120" max="10" step="1" value="${o.ceil}"><b id="wf-ceil-text"></b>
+    </div>
+    <div class="grp"><label for="wf-contrast" title="Higher pushes the noise darker so transmissions stand out">Contrast</label>
+      <input type="range" id="wf-contrast" min="0.5" max="3" step="0.1" value="${o.contrast}"><b id="wf-contrast-text">${Number(o.contrast).toFixed(1)}×</b></div>
+    <div class="grp"><button type="button" class="chip" id="wf-peak" aria-pressed="${o.peak}" title="A faint line that remembers each spot's highest level for a few seconds">Peak hold</button></div>
+    <div class="grp" role="group" aria-label="Zoom">
+      <span>Zoom</span>
+      <button type="button" class="btn" data-zoom="out" aria-label="Zoom out">−</button>
+      <button type="button" class="btn" data-zoom="in" aria-label="Zoom in">+</button>
+      <button type="button" class="btn" data-zoom="fit" title="Frame your frequencies">Fit</button>
+      <button type="button" class="btn" data-zoom="full" title="The whole band">Full</button>
+    </div>
+    <div class="grp"><label for="wf-speed" title="Changing it restarts the receiver for a moment">Speed</label>
+      <select id="wf-speed">${[5, 10, 15, 20, 30].map((v) => `<option value="${v}" ${v === rate ? "selected" : ""}>${v} lines/s</option>`).join("")}</select></div>
+  </div>`;
+}
+
+function wfShowLevels() {
+  const lv = wfLevels();
+  const fl = $("#wf-floor"), ce = $("#wf-ceil");
+  if (!fl) return;
+  if (wf.opts.auto) { fl.value = Math.round(lv.floor); ce.value = Math.round(lv.ceil); }
+  $("#wf-floor-text").textContent = `${Math.round(lv.floor)} dB`;
+  $("#wf-ceil-text").textContent = `${Math.round(lv.ceil)} dB`;
+  $("#wf-auto").setAttribute("aria-pressed", wf.opts.auto);
+}
+
+function wfSetView(lo, hi) {
+  const span = Math.max(0.02, Math.min(1, hi - lo));
+  lo = Math.max(0, Math.min(1 - span, lo));
+  wf.opts.lo = lo;
+  wf.opts.hi = lo + span;
+  wfSaveOpts();
+  wfRedraw();
+}
+
+function wfZoom(kind, aroundFrac = null) {
+  const { lo, hi } = wf.opts, span = hi - lo, mid = aroundFrac ?? (lo + hi) / 2;
+  if (kind === "full") return wfSetView(0, 1);
+  if (kind === "fit") {
+    if (!wf.meta || !station.frequencies.length) return wfSetView(0, 1);
+    const sr = wf.meta.sample_rate, low = wfLowHz();
+    const fr = station.frequencies.map((f) => (f.mhz * 1e6 - low) / sr);
+    const margin = 150e3 / sr;
+    return wfSetView(Math.min(...fr) - margin, Math.max(...fr) + margin);
+  }
+  const k = kind === "in" ? 0.5 : 2;
+  const nl = mid - (mid - lo) * k;
+  wfSetView(nl, nl + span * k);
 }
 
 function setupWaterfall() {
   clearInterval(wf.timer);
   wf.timer = setInterval(wfPoll, 150);
+  wfShowLevels();
   if (wf.meta) wfRedraw();
   wfPoll();
-  const box = $("#wf"), cursor = $("#wf-cursor"), readout = $("#wf-readout");
-  box.addEventListener("mousemove", (e) => {
-    if (!wf.meta) return;
-    const r = box.getBoundingClientRect();
-    cursor.classList.remove("hidden");
-    cursor.style.left = `${e.clientX - r.left}px`;
-    readout.textContent = `${wfFreqAt(e.clientX).toFixed(4)} MHz`;
+  const box = $("#wf"), cursor = $("#wf-cursor"), readout = $("#wf-readout"), trace = $("#wf-trace");
+
+  // levels
+  const manual = () => { wf.opts.auto = false; };
+  $("#wf-auto").addEventListener("click", () => {
+    wf.opts.auto = !wf.opts.auto;
+    if (!wf.opts.auto) { const lv = wfLevels(); wf.opts.floor = Math.round(lv.floor); wf.opts.ceil = Math.round(lv.ceil); }
+    wfSaveOpts(); wfShowLevels(); wfRedraw();
   });
-  box.addEventListener("mouseleave", () => { cursor.classList.add("hidden"); readout.textContent = ""; });
-  box.addEventListener("click", (e) => {
-    if (!wf.meta) return;
-    const mhz = wfFreqAt(e.clientX);
-    const near = station.frequencies.find((f) => Math.abs(f.mhz - mhz) < 0.01);
-    if (near) { location.hash = `#/frequency/${encodeURIComponent(near.id)}`; return; }
-    location.hash = `#/frequency/new?mhz=${(Math.round(mhz / 0.0125) * 0.0125).toFixed(4)}`;
+  $("#wf-floor").addEventListener("input", (e) => {
+    if (wf.opts.auto) { const lv = wfLevels(); wf.opts.ceil = Math.round(lv.ceil); }
+    manual();
+    wf.opts.floor = Math.min(Number(e.target.value), wf.opts.ceil - WF_MIN_RANGE_DB);
+    wfSaveOpts(); wfShowLevels(); wfRedraw();
   });
+  $("#wf-ceil").addEventListener("input", (e) => {
+    if (wf.opts.auto) { const lv = wfLevels(); wf.opts.floor = Math.round(lv.floor); }
+    manual();
+    wf.opts.ceil = Math.max(Number(e.target.value), wf.opts.floor + WF_MIN_RANGE_DB);
+    wfSaveOpts(); wfShowLevels(); wfRedraw();
+  });
+  $("#wf-contrast").addEventListener("input", (e) => {
+    wf.opts.contrast = Number(e.target.value);
+    $("#wf-contrast-text").textContent = `${wf.opts.contrast.toFixed(1)}×`;
+    wfSaveOpts(); wfRedraw();
+  });
+  $("#wf-peak").addEventListener("click", (e) => {
+    wf.opts.peak = !wf.opts.peak;
+    e.currentTarget.setAttribute("aria-pressed", wf.opts.peak);
+    wfSaveOpts(); wfTrace();
+  });
+  $$("[data-zoom]").forEach((b) => b.addEventListener("click", () => wfZoom(b.dataset.zoom)));
+  $("#wf-speed").addEventListener("change", (e) => {
+    const next = clone(station);
+    next.receiver.spectrum_rate = Number(e.target.value);
+    saveStation(next, `Waterfall at ${e.target.value} lines a second. The receiver restarts for a moment.`);
+  });
+
   // a gain change restarts the receiver (about 2 s), so it is saved when the slider is let go
   $("#wf-gain").addEventListener("input", (e) => { $("#wf-gain-text").textContent = `${Number(e.target.value).toFixed(1)} dB`; });
   $("#wf-gain").addEventListener("change", (e) => {
@@ -531,6 +713,93 @@ function setupWaterfall() {
     saveStation(clone(station), `Gain ${g.toFixed(1)} dB. The receiver restarts for a moment.`);
   });
   $(".gain").addEventListener("click", (e) => e.stopPropagation());
+
+  // cursor readout
+  box.addEventListener("mousemove", (e) => {
+    if (!wf.meta) return;
+    const r = box.getBoundingClientRect();
+    cursor.classList.remove("hidden");
+    cursor.style.left = `${e.clientX - r.left}px`;
+    readout.textContent = `${wfFreqAt(e.clientX).toFixed(4)} MHz`;
+  });
+  box.addEventListener("mouseleave", () => { cursor.classList.add("hidden"); readout.textContent = ""; });
+
+  // Ctrl + wheel zooms around the cursor
+  box.addEventListener("wheel", (e) => {
+    if (!e.ctrlKey || !wf.meta) return;
+    e.preventDefault();
+    const r = box.getBoundingClientRect();
+    wfZoom(e.deltaY < 0 ? "in" : "out", wf.opts.lo + ((e.clientX - r.left) / r.width) * (wf.opts.hi - wf.opts.lo));
+  }, { passive: false });
+
+  // drag a squelch line on the trace; drag the waterfall sideways to pan when zoomed
+  const hitLine = (e) => {
+    const r = trace.getBoundingClientRect();
+    const x = e.clientX - r.left, y = e.clientY - r.top;
+    return wfSquelchLines(r.width, r.height).find((s) => Math.abs(x - s.x) < 34 && Math.abs(y - s.y) < 8);
+  };
+  trace.addEventListener("mousemove", (e) => { if (!wf.drag) trace.classList.toggle("grab", !!(wf.meta && hitLine(e))); });
+  box.addEventListener("pointerdown", (e) => {
+    if (!wf.meta || e.button !== 0) return;
+    const hit = e.target === trace ? hitLine(e) : null;
+    wf.suppressClick = false;
+    if (hit) {
+      wf.drag = { kind: "squelch", id: hit.f.id, noise: hit.ch.noise_db };
+      trace.classList.add("dragging");
+    } else {
+      wf.drag = { kind: "pan", x: e.clientX, lo: wf.opts.lo, hi: wf.opts.hi, moved: false };
+    }
+    box.setPointerCapture(e.pointerId);
+  });
+  box.addEventListener("pointermove", (e) => {
+    const d = wf.drag;
+    if (!d) return;
+    if (d.kind === "squelch") {
+      const r = trace.getBoundingClientRect();
+      const db = wfTraceScale(r.height).db(e.clientY - r.top);
+      const sq = Math.max(0, Math.min(9, Math.round((db - d.noise) / 2)));
+      const f = station.frequencies.find((x) => x.id === d.id);
+      if (f && f.squelch !== sq) setTileSquelch(f, sq, false);
+      wf.suppressClick = true;
+      return;
+    }
+    const dx = e.clientX - d.x;
+    if (Math.abs(dx) > 4) d.moved = true;
+    if (d.moved && d.hi - d.lo < 1) {
+      box.classList.add("panning");
+      const shift = (-dx / box.clientWidth) * (d.hi - d.lo);
+      wf.opts.lo = Math.max(0, Math.min(1 - (d.hi - d.lo), d.lo + shift));
+      wf.opts.hi = wf.opts.lo + (d.hi - d.lo);
+      wfRedraw();
+    }
+  });
+  const endDrag = () => {
+    const d = wf.drag;
+    if (!d) return;
+    wf.drag = null;
+    trace.classList.remove("dragging");
+    box.classList.remove("panning");
+    if (d.kind === "squelch") {
+      const f = station.frequencies.find((x) => x.id === d.id);
+      if (f) setTileSquelch(f, f.squelch, true);
+      wfTrace();
+    } else if (d.moved) {
+      wf.suppressClick = true;
+      wfSaveOpts();
+    }
+  };
+  box.addEventListener("pointerup", endDrag);
+  box.addEventListener("pointercancel", endDrag);
+
+  box.addEventListener("click", (e) => {
+    if (!wf.meta || wf.suppressClick) { wf.suppressClick = false; return; }
+    const mhz = wfFreqAt(e.clientX);
+    const near = station.frequencies.find((f) => Math.abs(f.mhz - mhz) < 0.01);
+    if (near) { location.hash = `#/frequency/${encodeURIComponent(near.id)}`; return; }
+    location.hash = `#/frequency/new?mhz=${(Math.round(mhz / 0.0125) * 0.0125).toFixed(4)}`;
+  });
+
+  // resize by the bottom edge
   const handle = $("#wf-resize");
   const setHeight = (h, save) => {
     h = Math.max(WF_MIN, Math.min(WF_MAX, Math.round(h)));
@@ -588,10 +857,14 @@ function updateMonitorLive() {
     const tile = $(`[data-tile="${CSS.escape(fs.id)}"]`);
     if (!tile) continue;
     tile.classList.toggle("on", fs.on_air);
-    $("[data-state]", tile).textContent = fs.on_air ? "ON AIR" : "IDLE";
+    tile.classList.toggle("rec", fs.recording);
+    const stateEl = $("[data-state]", tile);
+    stateEl.textContent = fs.recording ? "REC" : fs.on_air ? "ON AIR" : "IDLE";
+    stateEl.classList.toggle("rec", fs.recording);
+    stateEl.title = fs.recording ? "Being recorded now" : fs.on_air ? "Heard, but not saved" : "";
     const level = fs.on_air && fs.level_dbfs != null ? Math.max(4, Math.min(100, ((fs.level_dbfs + 60) / 60) * 100)) : 0;
     $("[data-meter]", tile).style.width = `${level}%`;
-    $("[data-heard]", tile).textContent = fs.on_air ? (fs.net ? `Recording ${fs.net}` : "Recording now") : ago(fs.last_heard_unix);
+    $("[data-heard]", tile).textContent = fs.recording ? (fs.net ? `Recording ${fs.net}` : "Recording now") : fs.on_air ? "On air · not saved" : ago(fs.last_heard_unix);
     const netTag = $("[data-netname]", tile);
     netTag.classList.toggle("hidden", !fs.net);
     netTag.textContent = fs.net ? fs.net : "";
@@ -666,6 +939,7 @@ function viewRecordings(main) {
     <section class="panel" aria-label="Day timeline">
       <div class="panel-head"><h2 id="day-title"></h2><span class="muted">Click a mark to hear it</span></div>
       <div class="lanes" id="lanes"></div>
+      <div class="summary" id="day-summary" aria-label="Day summary"></div>
       <div class="hours"><span>00</span><span>04</span><span>08</span><span>12</span><span>16</span><span>20</span><span>24</span></div>
       <div style="height:12px"></div>
     </section>
@@ -701,6 +975,8 @@ function drawDay() {
     return `<div class="lane"><span class="who" title="${esc(f ? label(f) : fq)}">${esc(fq)}</span><div class="track">${marks}</div><span class="count">${recs.length} rec.</span></div>`;
   }).join("") || `<div class="muted">No frequencies yet.</div>`;
 
+  $("#day-summary").innerHTML = daySummaryHtml(recList);
+
   const filter = $("#rec-filters").dataset.filter;
   const opts = [["all", "All"], ...freqs.map((f) => [f, f]), ["nets", "Nets"]];
   $("#rec-filters").innerHTML = opts.map(([v, t]) => `<button type="button" class="chip" data-act="rec-filter" data-value="${esc(v)}" aria-pressed="${v === filter}">${esc(t)}</button>`).join("");
@@ -723,6 +999,28 @@ function drawDay() {
     : `<div class="empty">${recList.length ? "Nothing here with this filter." : "Nothing was recorded on this day."}</div>`;
   if (!nets.length && filter === "nets") $("#rec-clips").innerHTML = `<div class="empty">No net was recorded on this day.</div>`;
   syncPlayButtons();
+}
+
+/** The day at a glance: overs and time on air, per frequency and per net. */
+function daySummaryHtml(recs) {
+  if (!recs.length) return "";
+  const oversOf = (r) => (r.overs.length ? r.overs : [{ start_unix: r.start_unix, duration_sec: r.duration_sec || 0 }]);
+  const tally = (list) => list.reduce((t, r) => { for (const o of oversOf(r)) { t.n++; t.sec += o.duration_sec || 0; } return t; }, { n: 0, sec: 0 });
+  const mins = (sec) => (sec < 60 ? `${Math.round(sec)} s` : `${Math.round(sec / 60)} min`);
+  const all = tally(recs);
+  const out = [`<div class="stat"><b>${all.n}</b>over${all.n === 1 ? "" : "s"} · ${mins(all.sec)} on air</div>`];
+  const freqs = [...new Set(recs.map((r) => r.freq).filter(Boolean))];
+  for (const fq of freqs) {
+    const t = tally(recs.filter((r) => r.freq === fq));
+    const f = station.frequencies.find((x) => fmtMhz(x.mhz) === fq);
+    out.push(`<div class="stat f" style="--fc:${f ? freqColour(f) : "var(--amber)"}"><b>${esc(fq)}</b>${t.n} over${t.n === 1 ? "" : "s"} · ${mins(t.sec)}</div>`);
+  }
+  for (const r of recs.filter((x) => x.net)) {
+    const ov = oversOf(r), last = ov[ov.length - 1];
+    const end = last.start_unix + (last.duration_sec || 0);
+    out.push(`<div class="stat"><b>${esc(r.net)}</b>${clock(r.start_unix)}–${clock(end)} · ${ov.length} over${ov.length === 1 ? "" : "s"}</div>`);
+  }
+  return out.join("");
 }
 
 // ---------- nets ----------
@@ -848,7 +1146,7 @@ function stopEditorTimers() { clearTimeout(planTimer); }
 
 function viewFrequency(main) {
   const existing = route.arg && route.arg !== "new" ? station.frequencies.find((f) => f.id === route.arg) : null;
-  freqDraft = existing ? clone(existing) : { id: "", mhz: Number(route.query.mhz) || null, name: "", modulation: "nfm", squelch: 5, record: true, ctcss_hz: null };
+  freqDraft = existing ? clone(existing) : { id: "", mhz: Number(route.query.mhz) || null, name: "", modulation: "nfm", squelch: 5, record: true, ctcss_hz: null, notify: false };
   const d = freqDraft;
   const tones = ctcssTones.map((t) => `<option value="${t}" ${d.ctcss_hz != null && Math.abs(d.ctcss_hz - t) < 0.05 ? "selected" : ""}>${t.toFixed(1)} Hz</option>`).join("");
   main.innerHTML = `<div class="page narrow">
@@ -874,6 +1172,8 @@ function viewFrequency(main) {
           <span class="hint">Ignores other stations on the same frequency. Use your repeater's tone.</span></div>
         <div class="field"><span class="label">Save recordings</span>
           <div style="display:flex;align-items:center;gap:12px;height:40px"><button class="switch" type="button" role="switch" id="f-record" aria-checked="${d.record}" aria-label="Save recordings"></button><span class="hint">Off: listen live only.</span></div></div>
+        <div class="field"><span class="label">Notify me when it becomes active</span>
+          <div style="display:flex;align-items:center;gap:12px;height:40px"><button class="switch" type="button" role="switch" id="f-notify" aria-checked="${!!d.notify}" aria-label="Notify me when it becomes active"></button><span class="hint">A Windows notification after 2 minutes of quiet, even with the window closed.</span></div></div>
       </div>
       <div class="actions">
         <button class="btn primary big" type="button" data-act="save-freq">${existing ? "Save" : "Add frequency"}</button>
@@ -956,6 +1256,8 @@ function viewSettings(main) {
       ${switchRow("autostart", "Start with Windows", info.autostart_available ? "Starts recording when you sign in, without opening the window." : "Available in the installed app.", s.autostart, !info.autostart_available)}
       ${switchRow("close_to_tray", "Keep recording when the window is closed", "The app stays in the system tray. Right-click its icon to quit.", s.close_to_tray)}
       ${switchRow("local_time", "Use local time in file names", "Off: UTC.", s.local_time)}
+      <div class="row"><div class="text"><div class="title">Appearance</div><div class="sub">The waterfall stays dark in every theme. Also on the button at the top right.</div></div>
+        <select id="s-theme" aria-label="Theme">${opt(["system", "light", "dark"], s.theme || "system", (v) => ({ system: "Same as Windows", light: "Light", dark: "Dark" })[v])}</select></div>
       <div class="row"><div class="text"><div class="title">Warn me if nothing is heard for</div><div class="sub">Usually means the antenna or dongle has a problem.</div></div>
         <select data-setting="silence_warning_hours" data-num aria-label="Silence warning">${opt([0, 6, 12, 24, 48, 72], s.silence_warning_hours, (v) => (v ? `${v} hours` : "Don't warn"))}</select></div>
     </div></section>
@@ -995,6 +1297,7 @@ function viewSettings(main) {
   </div>`;
   $("#folder-state").textContent = status ? `${status.recordings_dir_exists ? "Folder ready" : "Folder will be created"} · recordings use ${bytes(status.disk.used_bytes)}${status.disk.free_bytes != null ? " · " + bytes(status.disk.free_bytes) + " free on this drive" : ""}` : "";
   $("#r-gain").addEventListener("input", (e) => { $("#r-gain-text").textContent = e.target.value; });
+  $("#s-theme").addEventListener("change", (e) => setTheme(e.target.value));
   $("#s-join").addEventListener("input", (e) => { $("#s-join-text").textContent = `${e.target.value} s`; });
   $("#engine-details").addEventListener("toggle", async (e) => {
     if (!e.target.open) return;
@@ -1015,18 +1318,28 @@ function switchRow(key, title, sub, on, disabled = false) {
 
 let squelchTimer = null;
 
+/** Shows a frequency's new squelch on its tile and the trace; `save` sends it (live, no restart). */
+function setTileSquelch(f, sq, save) {
+  f.squelch = sq;
+  const id = CSS.escape(f.id);
+  const slider = $(`[data-squelch-id="${id}"]`);
+  if (slider) slider.value = sq;
+  const num = $(`[data-squelch="${id}"]`);
+  if (num) num.textContent = sq;
+  const warn = $(`[data-open-warning="${id}"]`);
+  if (warn) warn.classList.toggle("hidden", !(sq === 0 && f.record));
+  wfTrace();
+  clearTimeout(squelchTimer);
+  if (save) squelchTimer = setTimeout(() => saveStation(clone(station), `Squelch ${sq} on ${label(f)}`), 300);
+}
+
 // tile squelch sliders: the number follows the slider, the station is saved once it stops moving
 document.addEventListener("input", (e) => {
   const id = e.target.dataset.squelchId;
   if (!id) return;
   const f = station.frequencies.find((x) => x.id === id);
   if (!f) return;
-  f.squelch = Number(e.target.value);
-  $(`[data-squelch="${CSS.escape(id)}"]`).textContent = f.squelch;
-  const warn = $(`[data-open-warning="${CSS.escape(id)}"]`);
-  if (warn) warn.classList.toggle("hidden", !(f.squelch === 0 && f.record));
-  wfTrace();
-  clearTimeout(squelchTimer);
+  setTileSquelch(f, Number(e.target.value), false);
   squelchTimer = setTimeout(() => saveStation(clone(station), `Squelch ${f.squelch} on ${label(f)}`), 900);
 });
 
@@ -1114,6 +1427,7 @@ const actions = {
     d.squelch = Number($("#f-sq").value);
     d.ctcss_hz = $("#f-ctcss").value ? Number($("#f-ctcss").value) : null;
     d.record = $("#f-record").getAttribute("aria-checked") === "true";
+    d.notify = $("#f-notify").getAttribute("aria-checked") === "true";
     const next = clone(station);
     const i = next.frequencies.findIndex((f) => d.id && f.id === d.id);
     if (i >= 0) {
@@ -1184,16 +1498,52 @@ document.addEventListener("change", async (e) => {
   }
 });
 
-$("#btn-recording").addEventListener("click", async () => {
-  if (!status) return;
-  const enable = !status.recording_enabled;
-  if (!enable && !confirm("Stop recording? The receiver keeps running, so you can still watch the waterfall and listen live, but nothing is saved until you start recording again.")) return;
+$("#mode-switch").addEventListener("click", async (e) => {
+  const b = e.target.closest("button");
+  if (!b || !status) return;
+  const enable = b.dataset.mode === "auto";
+  if (enable === status.recording_enabled) return;
+  if (!enable && !confirm("Switch to listen only? The waterfall and live listening keep working, but nothing is saved until you switch back to auto-record.")) return;
   try {
     await api("/api/recording", { method: "POST", body: { enabled: enable } });
-    toast(enable ? "Recording starts in a few seconds" : "Recording stopped. Still listening.");
+    toast(enable ? "Auto-record on: every transmission is recorded" : "Listen only: nothing is saved");
     pollStatus();
   } catch (err) { toast(err.message, true); }
 });
+
+// ---------- theme ----------
+
+const THEMES = ["system", "light", "dark"];
+const THEME_ICON = {
+  system: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>',
+  light: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>',
+  dark: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4 8 8 0 1 0 20 14.5z"/></svg>',
+};
+const prefersLight = matchMedia("(prefers-color-scheme: light)");
+
+function applyTheme() {
+  const t = (station && station.settings.theme) || "system";
+  document.documentElement.dataset.theme = t === "system" ? (prefersLight.matches ? "light" : "dark") : t;
+  try { localStorage.setItem("theme", t); } catch { /* private window */ }
+  const btn = $("#btn-theme");
+  btn.innerHTML = THEME_ICON[t];
+  const name = { system: "Same as Windows", light: "Light", dark: "Dark" }[t];
+  btn.title = `Theme: ${name} (click to change)`;
+  btn.setAttribute("aria-label", `Theme: ${name}. Click to change.`);
+  const sel = $("#s-theme");
+  if (sel) sel.value = t;
+}
+
+async function setTheme(t) {
+  const next = clone(station);
+  next.settings.theme = t;
+  station.settings.theme = t;
+  applyTheme();
+  await saveStation(next, "");
+}
+
+prefersLight.addEventListener("change", applyTheme);
+$("#btn-theme").addEventListener("click", () => setTheme(THEMES[(THEMES.indexOf(station.settings.theme || "system") + 1) % THEMES.length]));
 
 // ---------- start ----------
 
@@ -1203,6 +1553,7 @@ $("#btn-recording").addEventListener("click", async () => {
     station = res.station;
     ctcssTones = res.ctcss_tones;
     info = res;
+    applyTheme();
   } catch (e) {
     $("#main").innerHTML = `<div class="page"><div class="banner">${esc(e.message)}</div></div>`;
     return;

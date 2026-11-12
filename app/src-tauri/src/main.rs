@@ -8,6 +8,7 @@ use std::time::Duration;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri_plugin_notification::NotificationExt;
 
 /// A fixed port keeps the page origin stable, so per-browser settings survive
 /// restarts. Falls back to any free port if it is taken.
@@ -33,9 +34,9 @@ fn show_main(app: &AppHandle) {
 
 fn recording_label(state: &AppState) -> &'static str {
     if state.recording_enabled() {
-        "Stop recording"
+        "Switch to listen only"
     } else {
-        "Start recording"
+        "Switch to auto-record"
     }
 }
 
@@ -46,6 +47,7 @@ fn main() {
     let app = tauri::Builder::default()
         // a second copy would fight the first one for the dongle: bring the first one forward instead
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main(app)))
+        .plugin(tauri_plugin_notification::init())
         .setup(move |app| {
             let resources = app.path().resource_dir()?;
             let data = app.path().app_data_dir()?;
@@ -59,6 +61,12 @@ fn main() {
                 autostart_exe: std::env::current_exe().ok(),
             });
             app.manage(state.clone());
+
+            // "145.400 is active" toasts for frequencies that ask for them
+            let notify_handle = app.handle().clone();
+            *state.notifier.lock().unwrap() = Some(Arc::new(move |title: &str, body: &str| {
+                let _ = notify_handle.notification().builder().title(title).body(body).show();
+            }));
 
             let port = runtime.block_on(async {
                 state.start_supervisor();

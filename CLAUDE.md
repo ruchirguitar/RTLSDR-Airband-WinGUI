@@ -113,6 +113,24 @@ for the GPL).
   noise floor for that channel (spectrum packet v2) + 2 dB per slider step;
   the dot is its signal level, amber while open. Gain slider in the
   waterfall header saves on release.
+- Header (2026-11-12): an `Auto-record | Listen only` switch replaced
+  Start/Stop. Status states are `armed` / `listening` (were recording /
+  monitoring); each frequency in /api/status has `recording` (on air, auto-record
+  on, `record` set), so the pill turns red "Recording 145.400" and tiles show REC
+  only while a file is written.
+- Waterfall toolbar: Auto levels / Floor / Ceiling (dB) / Contrast (gamma) /
+  Peak hold / Zoom (− + Fit Full, Ctrl+wheel, drag to pan) are per-viewer
+  (localStorage `wfOpts`); Speed is `receiver.spectrum_rate` (5-30, engine
+  restart). Squelch lines on the trace can be dragged. A gain hint shows when a
+  peak is above −8 dB, the floor above −55 dB, or gain under 12 dB with a very
+  low floor (thresholds are guesses, not tuned).
+- Theme: `settings.theme` system/light/dark (header button + Settings),
+  mirrored to localStorage so index.html sets it before first paint. Colours
+  are tokens in style.css; the waterfall stays dark.
+- Per-frequency `notify`: the supervisor calls `AppState.notifier` (set by the
+  Tauri shell via tauri-plugin-notification) when a frequency is heard after
+  2 min of quiet. Not yet seen working in the installed app.
+- Recordings shows a day summary (overs, time on air, per frequency, nets).
 - "Stop recording" only stops saving: the engine keeps running without file
   outputs (state "monitoring"), so live listening and the waterfall go on.
   Quitting the app releases the dongle.
