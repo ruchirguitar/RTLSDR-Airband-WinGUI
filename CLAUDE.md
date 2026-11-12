@@ -131,10 +131,30 @@ for the GPL).
   Tauri shell via tauri-plugin-notification) when a frequency is heard after
   2 min of quiet. Not yet seen working in the installed app.
 - Recordings shows a day summary (overs, time on air, per frequency, nets).
+- Other devices on the network (`remote.rs`): the app's own window stays on
+  127.0.0.1 with no password. With `settings.remote_access` and a password
+  (salted, iterated SHA-256 in `remote.json`, never in station.json), the
+  supervisor opens a second listener on 0.0.0.0:5055 that serves the same
+  router behind `guard`: sign-in page `/login`, 30-day in-memory sessions
+  (cookie `fr_session`), 10 wrong passwords a minute max. Remote devices can't
+  use `/api/reveal`, `/api/pick-folder` or `/api/remote*`, can't change
+  remote access, the recordings folder or autostart, and get download
+  buttons (`/audio/...?download=1`) instead of folder buttons. With
+  `remote_read_only` they can only GET (and `/api/plan`). `/api/station`
+  returns `client: {remote, read_only}`; the UI hides `.rw` controls for
+  read-only devices, and a remote device's theme is its own (localStorage).
+  Checked 2026-11-12 through the dev server: sign-in, wrong password,
+  downloads, read-only refusals, LAN address answering, switching off closes
+  the port. Not yet tried from a real second device or with the Windows
+  firewall prompt.
+- Explorer "show in folder" passes `/select,"path"` raw: Rust's own quoting
+  made Explorer open Documents for paths with spaces.
 - "Stop recording" only stops saving: the engine keeps running without file
   outputs (state "monitoring"), so live listening and the waterfall go on.
   Quitting the app releases the dongle.
 - To debug the app locally without Tauri:
   `cd app && cargo run -p airband-backend --example dev_server [engine exe]`
   (defaults to `src-tauri/engine-bin/rtl_airband.exe`, data in
-  `%TEMP%\frequency-recorder-dev`), then open http://127.0.0.1:5050.
+  `%TEMP%\frequency-recorder-dev`), then open http://127.0.0.1:5050
+  (`PORT` env picks another port). It can't share the dongle or port 5050
+  with a running installed app.

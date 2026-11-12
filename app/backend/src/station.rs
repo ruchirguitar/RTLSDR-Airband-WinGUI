@@ -128,11 +128,25 @@ pub struct Settings {
     pub close_to_tray: bool,
     /// "system", "light" or "dark".
     pub theme: String,
+    /// Serve the app to other devices on the network (behind a password, remote.rs).
+    pub remote_access: bool,
+    /// Other devices can watch and listen but not change anything.
+    pub remote_read_only: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { recordings_dir: String::new(), retention_days: 90, local_time: true, silence_warning_hours: 24, autostart: false, close_to_tray: true, theme: "system".into() }
+        Settings {
+            recordings_dir: String::new(),
+            retention_days: 90,
+            local_time: true,
+            silence_warning_hours: 24,
+            autostart: false,
+            close_to_tray: true,
+            theme: "system".into(),
+            remote_access: false,
+            remote_read_only: false,
+        }
     }
 }
 

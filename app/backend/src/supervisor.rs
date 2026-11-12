@@ -292,6 +292,7 @@ pub fn spawn(app: std::sync::Arc<AppState>) {
             interval.tick().await;
             let a = app.clone();
             let _ = tokio::task::spawn_blocking(move || tick(&a, chrono::Local::now().naive_local())).await;
+            crate::remote::reconcile(&app).await;
         }
     });
 }

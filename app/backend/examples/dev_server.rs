@@ -18,7 +18,9 @@ async fn main() {
         autostart_exe: None,
     });
     state.start_supervisor();
-    let port = airband_backend::serve(state, 5050).await.unwrap();
+    // PORT lets it run beside the installed app, which uses 5050
+    let wanted = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(5050);
+    let port = airband_backend::serve(state, wanted).await.unwrap();
     println!("http://127.0.0.1:{port}/  (data in {})", data.display());
     std::future::pending::<()>().await;
 }

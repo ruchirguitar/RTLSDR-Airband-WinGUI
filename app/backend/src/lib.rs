@@ -6,6 +6,7 @@ pub mod libconfig;
 pub mod live;
 pub mod process;
 pub mod recordings;
+pub mod remote;
 pub mod spectrum;
 pub mod station;
 pub mod supervisor;
@@ -55,6 +56,7 @@ pub struct AppState {
     recording_enabled: Mutex<bool>,
     /// Shows a desktop notification (title, body); set by the Windows shell.
     pub notifier: Mutex<Option<Notifier>>,
+    pub remote: remote::RemoteAccess,
 }
 
 pub type Notifier = Arc<dyn Fn(&str, &str) + Send + Sync>;
@@ -112,7 +114,9 @@ impl AppState {
     pub fn new(paths: Paths) -> Shared {
         let station: Station = read_json(&paths.data_dir.join("station.json"));
         let prefs: Prefs = read_json(&paths.data_dir.join("state.json"));
+        let remote = remote::RemoteAccess::load(&paths.data_dir);
         Arc::new(AppState {
+            remote,
             paths,
             process: process::ProcessManager::new(),
             live: live::LiveAudioManager::default(),
@@ -180,8 +184,14 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
     tokio::task::spawn_blocking(f).await.map_err(internal)
 }
 
-async fn get_station(State(app): State<Shared>) -> ApiResult {
+/// The local window has no Client extension: it is neither remote nor read-only.
+fn client_of(c: Option<axum::Extension<remote::Client>>) -> remote::Client {
+    c.map(|axum::Extension(c)| c).unwrap_or_default()
+}
+
+async fn get_station(State(app): State<Shared>, client: Option<axum::Extension<remote::Client>>) -> ApiResult {
     Ok(Json(json!({
+        "client": client_of(client),
         "station": app.station(),
         "ctcss_tones": station::CTCSS_TONES.to_vec(),
         "default_recordings_dir": app.paths.default_recordings_dir,
@@ -199,13 +209,20 @@ fn fill_ids(s: &mut Station) {
     }
 }
 
-async fn put_station(State(app): State<Shared>, Json(mut new): Json<Station>) -> ApiResult {
+async fn put_station(State(app): State<Shared>, client: Option<axum::Extension<remote::Client>>, Json(mut new): Json<Station>) -> ApiResult {
     fill_ids(&mut new);
     let errors = new.validate();
     if !errors.is_empty() {
         return Err(ApiError(StatusCode::BAD_REQUEST, json!({"error": errors[0], "errors": errors})));
     }
     let old = app.station();
+    if client_of(client).remote {
+        // other devices can't change who may reach the app, or where it saves on this PC
+        new.settings.remote_access = old.settings.remote_access;
+        new.settings.remote_read_only = old.settings.remote_read_only;
+        new.settings.recordings_dir = old.settings.recordings_dir.clone();
+        new.settings.autostart = old.settings.autostart;
+    }
     if new.settings.autostart != old.settings.autostart {
         let exe = app.paths.autostart_exe.clone().ok_or_else(|| bad_request("Starting with Windows only works in the installed app."))?;
         let enabled = new.settings.autostart;
@@ -214,7 +231,24 @@ async fn put_station(State(app): State<Shared>, Json(mut new): Json<Station>) ->
     write_json(&app.paths.data_dir.join("station.json"), &new).map_err(internal)?;
     *app.station.lock().unwrap() = new.clone();
     let _ = app.ensure_recordings_dir();
+    remote::reconcile(&app).await;
     Ok(Json(json!({"station": new})))
+}
+
+async fn get_remote(State(app): State<Shared>) -> ApiResult {
+    Ok(Json(remote::status(&app)))
+}
+
+#[derive(Deserialize)]
+struct PasswordBody {
+    password: String,
+}
+
+async fn post_remote_password(State(app): State<Shared>, Json(body): Json<PasswordBody>) -> ApiResult {
+    let a = app.clone();
+    blocking(move || a.remote.set_password(&a.paths.data_dir, &body.password)).await?.map_err(bad_request)?;
+    remote::reconcile(&app).await;
+    Ok(Json(remote::status(&app)))
 }
 
 #[derive(Deserialize)]
@@ -357,12 +391,24 @@ async fn pick_folder(State(app): State<Shared>) -> ApiResult {
     Ok(Json(json!({"path": picked})))
 }
 
-async fn serve_audio(State(app): State<Shared>, UrlPath(relpath): UrlPath<String>, req: Request) -> Result<Response, ApiError> {
+#[derive(Deserialize)]
+struct AudioQuery {
+    download: Option<u8>,
+}
+
+async fn serve_audio(State(app): State<Shared>, UrlPath(relpath): UrlPath<String>, Query(q): Query<AudioQuery>, req: Request) -> Result<Response, ApiError> {
     let full = safe_subpath(&app.recordings_dir(), &relpath)?;
     if !full.is_file() {
         return Err(not_found());
     }
-    ServeFile::new(full).oneshot(req).await.map(|r| r.map(Body::new)).map_err(internal)
+    let name = full.file_name().map(|n| n.to_string_lossy().replace('"', "")).unwrap_or_default();
+    let mut resp = ServeFile::new(full).oneshot(req).await.map(|r| r.map(Body::new)).map_err(internal)?;
+    if q.download == Some(1) {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&format!("attachment; filename=\"{name}\"")) {
+            resp.headers_mut().insert(axum::http::header::CONTENT_DISPOSITION, v);
+        }
+    }
+    Ok(resp)
 }
 
 #[derive(Deserialize)]
@@ -429,6 +475,8 @@ pub fn router(app: Shared) -> Router {
         .route("/api/live/:port/chunk", get(live_chunk))
         .route("/api/engine/log", get(engine_log))
         .route("/api/spectrum", get(get_spectrum))
+        .route("/api/remote", get(get_remote))
+        .route("/api/remote/password", post(post_remote_password))
         .route("/audio/*relpath", get(serve_audio))
         .with_state(app)
 }

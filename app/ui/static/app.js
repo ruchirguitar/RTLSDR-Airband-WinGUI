@@ -15,10 +15,13 @@ const ICON = {
   plus: '<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
   alert: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 3l10 18H2z"/><path d="M12 10v4M12 18h0"/></svg>',
   left: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg>',
+  download: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg>',
   right: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>',
 };
 
 let station = null;
+/** Who this page is: the app's own window, or another device on the network (remote.rs). */
+let client = { remote: false, read_only: false };
 let ctcssTones = [];
 let info = {};
 let status = null;
@@ -34,6 +37,7 @@ async function api(path, opts = {}) {
     init.body = JSON.stringify(opts.body);
   }
   const res = await fetch(path, init);
+  if (res.status === 401 && client.remote) { location.href = "/login"; throw new Error("Signed out"); }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `${res.status} ${res.statusText}`);
   return data;
@@ -331,7 +335,7 @@ function viewMonitor(main) {
     <section class="panel" aria-label="Waterfall">
       <div class="panel-head"><h2>Waterfall</h2><span class="muted">Click to add a frequency. Drag a coloured squelch line to set it. Ctrl + wheel zooms.</span>
         <span class="grow"></span><span class="mono" id="wf-readout" style="color:var(--cyan-hi)"></span>
-        <label class="gain" for="wf-gain">Gain <input type="range" id="wf-gain" min="0" max="49.6" step="0.1" value="${station.receiver.gain_db}"> <b class="mono" id="wf-gain-text">${station.receiver.gain_db.toFixed(1)} dB</b></label></div>
+        <label class="gain rw" for="wf-gain">Gain <input type="range" id="wf-gain" min="0" max="49.6" step="0.1" value="${station.receiver.gain_db}"> <b class="mono" id="wf-gain-text">${station.receiver.gain_db.toFixed(1)} dB</b></label></div>
       ${wfToolsHtml()}
       <div class="wf-hint hidden" id="wf-hint" role="status"></div>
       <div class="wf" id="wf" style="height:${wfHeight()}px">
@@ -346,7 +350,7 @@ function viewMonitor(main) {
     </section>
     <section class="tiles" aria-label="Frequencies">
       ${station.frequencies.map(tileHtml).join("")}
-      <a class="add-tile" href="#/frequency/new">${ICON.plus}Add frequency<span class="faint">Anything inside the band shown above</span></a>
+      <a class="add-tile rw" href="#/frequency/new">${ICON.plus}Add frequency<span class="faint">Anything inside the band shown above</span></a>
     </section>
     <section class="panel" aria-label="Latest recordings">
       <div class="panel-head"><h2>Latest recordings</h2><span class="grow"></span><a href="#/recordings">See all</a></div>
@@ -622,7 +626,7 @@ function wfToolsHtml() {
       <button type="button" class="btn" data-zoom="fit" title="Frame your frequencies">Fit</button>
       <button type="button" class="btn" data-zoom="full" title="The whole band">Full</button>
     </div>
-    <div class="grp"><label for="wf-speed" title="Changing it restarts the receiver for a moment">Speed</label>
+    <div class="grp rw"><label for="wf-speed" title="Changing it restarts the receiver for a moment">Speed</label>
       <select id="wf-speed">${[5, 10, 15, 20, 30].map((v) => `<option value="${v}" ${v === rate ? "selected" : ""}>${v} lines/s</option>`).join("")}</select></div>
   </div>`;
 }
@@ -741,7 +745,7 @@ function setupWaterfall() {
   trace.addEventListener("mousemove", (e) => { if (!wf.drag) trace.classList.toggle("grab", !!(wf.meta && hitLine(e))); });
   box.addEventListener("pointerdown", (e) => {
     if (!wf.meta || e.button !== 0) return;
-    const hit = e.target === trace ? hitLine(e) : null;
+    const hit = e.target === trace && !client.read_only ? hitLine(e) : null;
     wf.suppressClick = false;
     if (hit) {
       wf.drag = { kind: "squelch", id: hit.f.id, noise: hit.ch.noise_db };
@@ -792,7 +796,7 @@ function setupWaterfall() {
   box.addEventListener("pointercancel", endDrag);
 
   box.addEventListener("click", (e) => {
-    if (!wf.meta || wf.suppressClick) { wf.suppressClick = false; return; }
+    if (!wf.meta || wf.suppressClick || client.read_only) { wf.suppressClick = false; return; }
     const mhz = wfFreqAt(e.clientX);
     const near = station.frequencies.find((f) => Math.abs(f.mhz - mhz) < 0.01);
     if (near) { location.hash = `#/frequency/${encodeURIComponent(near.id)}`; return; }
@@ -831,7 +835,7 @@ function tileHtml(f) {
       ${f.ctcss_hz ? `<span class="tag">CTCSS ${f.ctcss_hz}</span>` : ""}${f.record ? "" : '<span class="tag">Not recorded</span>'}
       <span class="tag amber hidden" data-netname></span>
       <span class="grow"></span><span class="state" data-state>IDLE</span>
-      <a class="btn ghost icon" href="#/frequency/${encodeURIComponent(f.id)}" aria-label="Edit ${esc(label(f))}">${ICON.edit}</a>
+      <a class="btn ghost icon rw" href="#/frequency/${encodeURIComponent(f.id)}" aria-label="Edit ${esc(label(f))}">${ICON.edit}</a>
     </div>
     <div><span class="freq">${fmtMhz(f.mhz)}</span><span class="unit">MHz</span></div>
     <div class="meter" aria-hidden="true"><i data-meter></i></div>
@@ -915,7 +919,8 @@ function recRowHtml(rec, opts = {}) {
     <div class="overs">${oversBar(rec)}</div>
     <span class="d">${rec.duration_sec != null ? dur(rec.duration_sec) : bytes(rec.bytes)}</span>
     ${opts.actions ? `<button class="btn ghost icon" type="button" data-act="reveal" data-path="${esc(rec.path)}" aria-label="Show in folder">${ICON.folder}</button>
-      <button class="btn ghost icon" type="button" data-act="delete-rec" data-path="${esc(rec.path)}" aria-label="Delete">${ICON.trash}</button>` : ""}
+      <a class="btn ghost icon dl" href="/audio/${encodePath(rec.path)}?download=1" download aria-label="Download">${ICON.download}</a>
+      <button class="btn ghost icon rw" type="button" data-act="delete-rec" data-path="${esc(rec.path)}" aria-label="Delete">${ICON.trash}</button>` : ""}
   </div>`;
 }
 
@@ -990,7 +995,8 @@ function drawDay() {
         <div class="muted" style="font-size:12px">${clock(r.start_unix)} · ${r.overs.length ? `${dur(r.duration_sec)} of speech, silences removed · ${r.overs.length} overs` : bytes(r.bytes)}</div></div>
         <span class="grow"></span>
         <button class="btn" type="button" data-act="reveal" data-path="${esc(r.path)}">${ICON.folder}Show in folder</button>
-        <button class="btn ghost icon" type="button" data-act="delete-rec" data-path="${esc(r.path)}" aria-label="Delete">${ICON.trash}</button>
+        <a class="btn dl" href="/audio/${encodePath(r.path)}?download=1" download>${ICON.download}Download</a>
+        <button class="btn ghost icon rw" type="button" data-act="delete-rec" data-path="${esc(r.path)}" aria-label="Delete">${ICON.trash}</button>
       </div>
       <div class="overs">${oversBar(r)}${r.overs.slice(1).map((o) => `<b style="left:${(o.offset_sec / (r.duration_sec || 1)) * 100}%"></b>`).join("")}</div>
     </article>`).join("");
@@ -1050,7 +1056,7 @@ function viewNets(main) {
   main.innerHTML = `<div class="page">
     <div id="banners">${bannerHtml()}</div>
     <div class="page-head"><h1>Nets</h1><span class="muted">During a net, every over goes into one recording with the silences cut out.</span><span class="grow"></span>
-      <a class="btn primary" href="#/net/new">Add net</a></div>
+      <a class="btn primary rw" href="#/net/new">Add net</a></div>
     ${station.nets.length ? `<section class="net-grid" id="net-grid">${station.nets.map(netTileHtml).join("")}</section>`
       : `<div class="panel empty"><h3>No nets yet</h3><p>Add your morning or evening net and it's recorded as one file, ready to listen to or transcribe.</p></div>`}
     <section class="panel" aria-label="How nets are recorded">
@@ -1070,7 +1076,7 @@ function viewNets(main) {
         <div class="row"><div class="text"><div class="title">Even out loudness</div><div class="sub">Weak and strong stations play at the same volume.</div></div>
           <button class="switch" type="button" role="switch" id="opt-norm" aria-checked="${o.normalize}" aria-label="Even out loudness"></button></div>
         <div class="hint">These also apply to everyday recordings. A list of the time of every over is always saved next to each recording, for transcripts.</div>
-        <div class="actions"><button class="btn primary" type="button" data-act="save-net-options">Save</button></div>
+        <div class="actions rw"><button class="btn primary" type="button" data-act="save-net-options">Save</button></div>
       </div>
     </section>
   </div>`;
@@ -1085,10 +1091,10 @@ function netTileHtml(n) {
     <div style="display:flex;align-items:baseline;gap:10px"><span class="when">${esc(n.start)} – ${esc(n.end)}</span><span class="mono" style="color:var(--amber)">${fmtMhz(n.mhz)}</span></div>
     <div class="muted" style="font-size:12px">${esc(daysText(n.days))}${f && f.name ? " · " + esc(f.name) : ""}</div>
     <div style="display:flex;gap:8px;align-items:center;margin-top:4px">
-      <a class="btn" href="#/net/${encodeURIComponent(n.id)}">${ICON.edit}Edit</a>
+      <a class="btn rw" href="#/net/${encodeURIComponent(n.id)}">${ICON.edit}Edit</a>
       <a class="btn ghost" href="#/recordings?freq=nets">Recordings</a>
       <span class="grow"></span>
-      <button class="switch" type="button" role="switch" data-act="toggle-net" data-id="${esc(n.id)}" aria-checked="${n.enabled}" aria-label="Record ${esc(n.name)}"></button>
+      <button class="switch rw" type="button" role="switch" data-act="toggle-net" data-id="${esc(n.id)}" aria-checked="${n.enabled}" aria-label="Record ${esc(n.name)}"></button>
     </div>
   </article>`;
 }
@@ -1262,6 +1268,18 @@ function viewSettings(main) {
         <select data-setting="silence_warning_hours" data-num aria-label="Silence warning">${opt([0, 6, 12, 24, 48, 72], s.silence_warning_hours, (v) => (v ? `${v} hours` : "Don't warn"))}</select></div>
     </div></section>
 
+    ${client.remote ? "" : `<section class="panel" aria-label="Other devices on your network"><div class="panel-head"><h2>Other devices on your network</h2><span class="muted">Phones, tablets and other PCs on the same Wi-Fi</span></div><div class="panel-body">
+      <div class="field"><label for="r-pw">Password</label>
+        <div style="display:flex;gap:10px;flex-wrap:wrap"><input type="password" id="r-pw" autocomplete="new-password" placeholder="At least 6 characters" style="flex:1 1 220px">
+          <button class="btn" type="button" data-act="remote-password">Set password</button></div>
+        <span class="hint" id="r-pw-state"></span></div>
+      <div class="row"><div class="text"><div class="title">Allow other devices on my network</div><div class="sub">They sign in with the password. Windows may ask once whether to allow Frequency Recorder through the firewall: choose <b>Private networks</b>.</div></div>
+        <button class="switch" type="button" role="switch" data-act="remote-switch" id="r-on" aria-checked="${!!s.remote_access}" aria-label="Allow other devices on my network"></button></div>
+      <div class="row"><div class="text"><div class="title">Watch and listen only</div><div class="sub">Other devices see the waterfall, listen and play recordings, but can't change anything.</div></div>
+        ${`<button class="switch" type="button" role="switch" data-act="setting-switch" data-key="remote_read_only" aria-checked="${!!s.remote_read_only}" aria-label="Watch and listen only"></button>`}</div>
+      <div id="r-status" class="hint"></div>
+    </div></section>`}
+
     <section class="panel" aria-label="Everyday recordings"><div class="panel-head"><h2>Everyday recordings</h2></div><div class="panel-body">
       <div class="form-grid">
         <div class="field"><label for="s-join">Put overs in the same recording when they're less than <b class="mono" id="s-join-text">${o.clip_join_sec} s</b> apart</label>
@@ -1298,6 +1316,7 @@ function viewSettings(main) {
   $("#folder-state").textContent = status ? `${status.recordings_dir_exists ? "Folder ready" : "Folder will be created"} · recordings use ${bytes(status.disk.used_bytes)}${status.disk.free_bytes != null ? " · " + bytes(status.disk.free_bytes) + " free on this drive" : ""}` : "";
   $("#r-gain").addEventListener("input", (e) => { $("#r-gain-text").textContent = e.target.value; });
   $("#s-theme").addEventListener("change", (e) => setTheme(e.target.value));
+  if (!client.remote) refreshRemote();
   $("#s-join").addEventListener("input", (e) => { $("#s-join-text").textContent = `${e.target.value} s`; });
   $("#engine-details").addEventListener("toggle", async (e) => {
     if (!e.target.open) return;
@@ -1307,6 +1326,27 @@ function viewSettings(main) {
       $("#engine-conf").textContent = log.config || "Not written yet.";
     } catch (err) { $("#engine-log").textContent = err.message; }
   });
+}
+
+/** Fills in the network-access part of Settings. */
+async function refreshRemote() {
+  let r;
+  try { r = await api("/api/remote"); } catch { return; }
+  const pw = $("#r-pw-state"), st = $("#r-status");
+  if (!pw) return;
+  pw.textContent = r.has_password ? "A password is set. Setting a new one signs every device out." : "Set a password first.";
+  $("#r-on").setAttribute("aria-checked", r.enabled);
+  if (r.error) { st.className = "hint bad"; st.textContent = r.error; return; }
+  if (r.running && r.url) {
+    st.className = "hint";
+    st.innerHTML = `On other devices, open <span class="remote-url">${esc(r.url)}</span>`;
+  } else if (r.running) {
+    st.className = "hint edge";
+    st.textContent = `On, at port ${r.port}, but this PC doesn't seem to be on a network.`;
+  } else {
+    st.className = "hint";
+    st.textContent = r.enabled && !r.has_password ? "Set a password to turn it on." : "Off: only this PC can open the app.";
+  }
 }
 
 function switchRow(key, title, sub, on, disabled = false) {
@@ -1335,7 +1375,7 @@ function setTileSquelch(f, sq, save) {
 
 // tile squelch sliders: the number follows the slider, the station is saved once it stops moving
 document.addEventListener("input", (e) => {
-  const id = e.target.dataset.squelchId;
+  const id = client.read_only ? null : e.target.dataset.squelchId;
   if (!id) return;
   const f = station.frequencies.find((x) => x.id === id);
   if (!f) return;
@@ -1451,6 +1491,28 @@ const actions = {
     next.settings[el.dataset.key] = !next.settings[el.dataset.key];
     if (await saveStation(next)) el.setAttribute("aria-checked", next.settings[el.dataset.key]);
   },
+  async "remote-password"() {
+    const input = $("#r-pw");
+    try {
+      await api("/api/remote/password", { method: "POST", body: { password: input.value } });
+      input.value = "";
+      toast("Password set");
+      refreshRemote();
+    } catch (e) { toast(e.message, true); }
+  },
+  async "remote-switch"(el) {
+    const on = el.getAttribute("aria-checked") !== "true";
+    if (on) {
+      const r = await api("/api/remote").catch(() => null);
+      if (r && !r.has_password) { toast("Set a password first", true); $("#r-pw").focus(); return; }
+    }
+    const next = clone(station);
+    next.settings.remote_access = on;
+    if (await saveStation(next, on ? "Other devices can now sign in" : "Only this PC can open the app now")) {
+      el.setAttribute("aria-checked", on);
+      setTimeout(refreshRemote, 300);
+    }
+  },
   async "pick-folder"() {
     try {
       const res = await api("/api/pick-folder", { method: "POST" });
@@ -1521,8 +1583,15 @@ const THEME_ICON = {
 };
 const prefersLight = matchMedia("(prefers-color-scheme: light)");
 
+function themeChoice() {
+  if (client.remote) {
+    try { return localStorage.getItem("theme") || "system"; } catch { return "system"; }
+  }
+  return (station && station.settings.theme) || "system";
+}
+
 function applyTheme() {
-  const t = (station && station.settings.theme) || "system";
+  const t = themeChoice();
   document.documentElement.dataset.theme = t === "system" ? (prefersLight.matches ? "light" : "dark") : t;
   try { localStorage.setItem("theme", t); } catch { /* private window */ }
   const btn = $("#btn-theme");
@@ -1535,6 +1604,11 @@ function applyTheme() {
 }
 
 async function setTheme(t) {
+  if (client.remote) {
+    // another device picks its own theme, without changing the PC's
+    try { localStorage.setItem("theme", t); } catch { /* private window */ }
+    return applyTheme();
+  }
   const next = clone(station);
   next.settings.theme = t;
   station.settings.theme = t;
@@ -1543,7 +1617,11 @@ async function setTheme(t) {
 }
 
 prefersLight.addEventListener("change", applyTheme);
-$("#btn-theme").addEventListener("click", () => setTheme(THEMES[(THEMES.indexOf(station.settings.theme || "system") + 1) % THEMES.length]));
+$("#btn-theme").addEventListener("click", () => setTheme(THEMES[(THEMES.indexOf(themeChoice()) + 1) % THEMES.length]));
+$("#btn-signout").addEventListener("click", async () => {
+  try { await fetch("/api/logout", { method: "POST" }); } catch { /* signed out anyway */ }
+  location.href = "/login";
+});
 
 // ---------- start ----------
 
@@ -1553,6 +1631,9 @@ $("#btn-theme").addEventListener("click", () => setTheme(THEMES[(THEMES.indexOf(
     station = res.station;
     ctcssTones = res.ctcss_tones;
     info = res;
+    client = res.client || client;
+    document.documentElement.classList.toggle("remote", client.remote);
+    document.documentElement.classList.toggle("read-only", client.read_only);
     applyTheme();
   } catch (e) {
     $("#main").innerHTML = `<div class="page"><div class="banner">${esc(e.message)}</div></div>`;

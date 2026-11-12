@@ -21,11 +21,12 @@
     <span id="net-pill" class="pill net hidden"></span>
     <span id="window-text" class="muted"></span>
     <span class="grow"></span>
-    <div class="mode hidden" id="mode-switch" role="group" aria-label="What the receiver does">
+    <div class="mode hidden rw" id="mode-switch" role="group" aria-label="What the receiver does">
       <button type="button" data-mode="auto" aria-pressed="true" title="Record every transmission that opens a squelch">Auto-record</button>
       <button type="button" data-mode="listen" aria-pressed="false" title="Keep the receiver running for the waterfall and listening, save nothing">Listen only</button>
     </div>
     <button id="btn-theme" class="icon-btn" type="button" aria-label="Theme"></button>
+    <button id="btn-signout" class="btn ghost remote-only" type="button">Sign out</button>
   </header>
 
   <div class="body">
@@ -33,8 +34,8 @@
       <a href="#/monitor" data-nav="monitor"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg><span>Monitor</span></a>
       <a href="#/recordings" data-nav="recordings"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 15v-4M11 15V9M15 15v-6M19 15v-2"/></svg><span>Recordings</span></a>
       <a href="#/nets" data-nav="nets"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg><span>Nets</span></a>
-      <a href="#/frequency/new" data-nav="frequency"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg><span>Add frequency</span></a>
-      <a href="#/settings" data-nav="settings"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/></svg><span>Settings</span></a>
+      <a href="#/frequency/new" data-nav="frequency" class="rw"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg><span>Add frequency</span></a>
+      <a href="#/settings" data-nav="settings" class="rw"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/></svg><span>Settings</span></a>
       <div class="grow"></div>
       <div class="disk" id="disk-box"></div>
     </nav>

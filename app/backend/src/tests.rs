@@ -190,3 +190,90 @@ async fn live_port_must_be_in_range() {
     let f = fixture();
     assert_eq!(call(&f.app, "GET", "/api/live/80/chunk", None).await.0, StatusCode::BAD_REQUEST);
 }
+
+async fn remote_call(app: &Shared, method: &str, uri: &str, cookie: Option<&str>, body: Option<Value>) -> (StatusCode, Option<String>, Value) {
+    let mut req = Request::builder().method(method).uri(uri);
+    if let Some(c) = cookie {
+        req = req.header("cookie", c);
+    }
+    let body = match body {
+        Some(v) => {
+            req = req.header("content-type", "application/json");
+            Body::from(v.to_string())
+        }
+        None => Body::empty(),
+    };
+    let resp = remote::remote_router(app.clone()).oneshot(req.body(body).unwrap()).await.unwrap();
+    let status = resp.status();
+    let set_cookie = resp.headers().get("set-cookie").and_then(|v| v.to_str().ok()).map(|v| v.split(';').next().unwrap().to_string());
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, set_cookie, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+#[test]
+fn passwords_are_salted_and_checked() {
+    let a = remote::hash_password("hunter22");
+    let b = remote::hash_password("hunter22");
+    assert_ne!(a, b, "a new salt each time");
+    assert!(remote::verify_password(&a, "hunter22"));
+    assert!(!remote::verify_password(&a, "hunter23"));
+    assert!(!remote::verify_password("", "hunter22"));
+}
+
+#[tokio::test]
+async fn other_devices_need_the_password() {
+    let f = fixture();
+    call_json(&f.app, "PUT", "/api/station", Some(two_repeaters())).await;
+    let (s, _) = call_json(&f.app, "POST", "/api/remote/password", Some(json!({"password": "abc"}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "too short");
+    let (s, v) = call_json(&f.app, "POST", "/api/remote/password", Some(json!({"password": "secret-pw"}))).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["has_password"], true);
+    assert!(!std::fs::read_to_string(f.dir.path().join("data/remote.json")).unwrap().contains("secret-pw"), "only the hash is stored");
+
+    let (s, _, _) = remote_call(&f.app, "GET", "/api/status", None, None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, _, _) = remote_call(&f.app, "GET", "/", None, None).await;
+    assert_eq!(s, StatusCode::SEE_OTHER, "pages go to the sign-in page");
+    let (s, _, _) = remote_call(&f.app, "GET", "/login", None, None).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, cookie, _) = remote_call(&f.app, "POST", "/api/login", None, Some(json!({"password": "wrong"}))).await;
+    assert_eq!((s, cookie), (StatusCode::UNAUTHORIZED, None));
+
+    let (s, cookie, _) = remote_call(&f.app, "POST", "/api/login", None, Some(json!({"password": "secret-pw"}))).await;
+    assert_eq!(s, StatusCode::OK);
+    let cookie = cookie.expect("a session cookie");
+    let (s, _, v) = remote_call(&f.app, "GET", "/api/station", Some(&cookie), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["client"]["remote"], true);
+    assert_eq!(v["client"]["read_only"], false);
+
+    // folder actions and remote access itself stay on this PC
+    let (s, _, _) = remote_call(&f.app, "POST", "/api/reveal", Some(&cookie), Some(json!({}))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _, _) = remote_call(&f.app, "POST", "/api/remote/password", Some(&cookie), Some(json!({"password": "taken-over"}))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    // a remote edit can't switch remote access off or move the recordings folder
+    let mut st = v["station"].clone();
+    st["settings"]["recordings_dir"] = json!("C:/elsewhere");
+    st["frequencies"][0]["squelch"] = json!(7);
+    let (s, _, v) = remote_call(&f.app, "PUT", "/api/station", Some(&cookie), Some(st)).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["station"]["frequencies"][0]["squelch"], 7);
+    assert_eq!(v["station"]["settings"]["recordings_dir"], "");
+
+    // watch-and-listen only
+    let (_, mut st) = call_json(&f.app, "GET", "/api/station", None).await;
+    st["station"]["settings"]["remote_read_only"] = json!(true);
+    call_json(&f.app, "PUT", "/api/station", Some(st["station"].clone())).await;
+    let (s, _, _) = remote_call(&f.app, "GET", "/api/status", Some(&cookie), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _, _) = remote_call(&f.app, "POST", "/api/recording", Some(&cookie), Some(json!({"enabled": false}))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    // a new password signs everyone out
+    call_json(&f.app, "POST", "/api/remote/password", Some(json!({"password": "another-pw"}))).await;
+    let (s, _, _) = remote_call(&f.app, "GET", "/api/status", Some(&cookie), None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+}

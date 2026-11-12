@@ -19,9 +19,12 @@ pub fn free_space(dir: &Path) -> Option<u64> {
 pub fn reveal(dir: &Path, file: Option<&Path>) -> std::io::Result<()> {
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
         let mut cmd = std::process::Command::new("explorer");
         match file {
-            Some(f) if f.is_file() => cmd.arg(format!("/select,{}", f.display())),
+            // Explorer wants /select,"C:\with spaces\file.mp3": Rust's own quoting would wrap
+            // the whole argument, which Explorer can't read, and it then opens Documents.
+            Some(f) if f.is_file() => cmd.raw_arg(explorer_select_arg(f)),
             Some(f) => cmd.arg(f),
             None => cmd.arg(dir),
         };
@@ -32,6 +35,21 @@ pub fn reveal(dir: &Path, file: Option<&Path>) -> std::io::Result<()> {
         let target = file.and_then(|f| if f.is_dir() { Some(f) } else { f.parent() }).unwrap_or(dir);
         let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
         std::process::Command::new(opener).arg(target).spawn().map(|_| ())
+    }
+}
+
+/// The Explorer argument that opens a file's folder with the file selected.
+/// Explorer only accepts backslashes here.
+pub fn explorer_select_arg(file: &Path) -> String {
+    format!("/select,\"{}\"", file.display().to_string().replace('/', "\\"))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn select_arg_quotes_the_path_only() {
+        let arg = super::explorer_select_arg(std::path::Path::new("C:/Users/me/Documents/Frequency Recordings/145.400/a b.mp3"));
+        assert_eq!(arg, r#"/select,"C:\Users\me\Documents\Frequency Recordings\145.400\a b.mp3""#);
     }
 }
 
