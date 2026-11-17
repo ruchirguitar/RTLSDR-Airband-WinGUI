@@ -39,9 +39,15 @@ A Windows desktop app for RTLSDR-Airband aimed at recording ham repeater nets.
   - `process.rs`, `libconfig.rs` (parser, used to check generated configs;
     tests round-trip `engine/config/*.conf`), `system.rs` (disk space,
     Explorer, folder picker via `rfd`, start with Windows via `auto-launch`).
+  - `remote.rs`: access from other devices on the network (password,
+    sessions, the second listener on port 5055).
+- `README.md` is for users (features, install, troubleshooting);
+  `BUILD-WINDOWS.md` for building, data locations and ports. Keep both
+  current when features change.
 - `app/src-tauri/`: Tauri 2 shell. Starts the backend on 127.0.0.1:5050 (or a
   free port) and the supervisor, opens a window on it, adds a tray icon
-  (Open / Start-Stop recording / Quit), hides to the tray on close when
+  (Open / Switch to listen only-auto-record / Quit), shows notifications
+  (tauri-plugin-notification), hides to the tray on close when
   `close_to_tray` is set, starts hidden with `--hidden` (used by autostart), and
   allows one instance only. Bundles `app/ui` and `src-tauri/engine-bin/` (the
   engine exe + DLLs, filled in by CI or by hand, not committed).
@@ -58,7 +64,8 @@ writes `<recordings>/Nets/<net name>/...` with `net_join_sec`. Switching costs
 an engine restart (~2 s). The engine runs hidden with stdin piped; closing the
 pipe makes it finish its recordings and exit (killed after 5 s). Data lives in
 `%APPDATA%\org.frequencyrecorder.app` (`station.json`, `state.json` for the
-on/off switch, generated `engine.conf`).
+Auto-record / Listen only switch, `remote.json` for the network password
+hash, generated `engine.conf`).
 
 ## Engine build
 
@@ -149,9 +156,13 @@ for the GPL).
   firewall prompt.
 - Explorer "show in folder" passes `/select,"path"` raw: Rust's own quoting
   made Explorer open Documents for paths with spaces.
-- "Stop recording" only stops saving: the engine keeps running without file
-  outputs (state "monitoring"), so live listening and the waterfall go on.
+- "Listen only" only stops saving: the engine keeps running without file
+  outputs (state "listening"), so live listening and the waterfall go on.
   Quitting the app releases the dongle.
+- Recordings can be hissy on weak signals; that's FM demodulation in the
+  channel, not wideband noise. Discussed 2026-11-17, not built: set the
+  engine's per-channel `highpass`/`lowpass` (~300-3000 Hz), trim squelch
+  tails, expose NFM de-emphasis (`tau`), optional speech denoiser.
 - To debug the app locally without Tauri:
   `cd app && cargo run -p airband-backend --example dev_server [engine exe]`
   (defaults to `src-tauri/engine-bin/rtl_airband.exe`, data in

@@ -73,16 +73,36 @@ Installers land in `app\target\release\bundle\nsis\` (`.exe`) and `...\bundle\ms
 | What | Where |
 |---|---|
 | Frequencies, nets and settings | `%APPDATA%\org.frequencyrecorder.app\station.json` |
-| Recording on/off switch | `%APPDATA%\org.frequencyrecorder.app\state.json` |
+| Auto-record / Listen only switch | `%APPDATA%\org.frequencyrecorder.app\state.json` |
+| Network-access password (salted hash only) | `%APPDATA%\org.frequencyrecorder.app\remote.json` |
 | Engine config the app writes (don't edit) | `%APPDATA%\org.frequencyrecorder.app\engine.conf` |
 | Recordings (default, changeable in Settings) | `Documents\Frequency Recordings\<freq>\` and `...\Nets\<net name>\` |
 
 "Start with Windows" adds `Frequency Recorder --hidden` under
 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`; turning it off removes it.
 
-To try the UI in a browser without Tauri (uses the dongle; data in `%TEMP%\frequency-recorder-dev`):
+## Ports
+
+| Port | Used for |
+|---|---|
+| 5050 (127.0.0.1) | The app's own window (falls back to a free port if taken) |
+| 5055 (all interfaces) | Other devices on the network, only while that's switched on in Settings |
+| 17299 (UDP, 127.0.0.1) | Waterfall lines from the engine |
+| 17300 + n (UDP, 127.0.0.1) | Live audio of frequency n from the engine |
+
+The first time network access is switched on, Windows Firewall asks whether to
+allow the app; allow **Private networks**.
+
+## Trying the UI without Tauri
+
+Runs the backend and the engine against `app/ui` in a normal browser (uses the
+dongle; data in `%TEMP%\frequency-recorder-dev`). Quit the installed app first:
+they can't share the dongle or port 5050.
 
 ```powershell
 cd RTLSDR-Airband-WinGUI\app
-cargo run -p airband-backend --example dev_server
+cargo run -p airband-backend --example dev_server        # http://127.0.0.1:5050
+$env:PORT = 5060; cargo run -p airband-backend --example dev_server   # another port
 ```
+
+Notifications, the tray and "Start with Windows" only work in the Tauri app.
