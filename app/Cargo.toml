@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["backend", "src-tauri"]
+
+[profile.release]
+opt-level = "s"
+lto = true

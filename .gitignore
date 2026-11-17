@@ -1,0 +1,4 @@
+app/target/
+app/src-tauri/gen/
+app/src-tauri/engine-bin/*
+!app/src-tauri/engine-bin/.gitkeep
